@@ -971,9 +971,13 @@ class ModelRunner:
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank."""
+        """Stop profiling for this rank.
+
+        Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
+        can report where the trace was written.
+        """
         if self.profiler is None:
-            return True
+            return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
         try:
@@ -982,12 +986,13 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+        elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
-            time.monotonic() - t0,
+            elapsed,
         )
-        return True
+        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
 
     def debug(self, *args: Any):
         if self.rank == 0:
@@ -2026,11 +2031,7 @@ class ModelRunner:
         sampled_logprobs = None
         if need_logprobs:
             logits_fp32 = logits.float()
-            safe_temps = torch.where(
-                temperatures <= 0, torch.ones_like(temperatures), temperatures
-            )
-            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
