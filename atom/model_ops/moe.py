@@ -20,7 +20,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from aiter.ops.flydsl.moe_common import GateMode
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -2217,9 +2217,13 @@ class FusedMoE(torch.nn.Module):
         )
         online_quant_type = online_quant_config.quant_type
         online_quant_dtype = online_quant_config.quant_dtype
-        quant_func = get_hip_quant(online_quant_type)
-
         source_quant_type = self.layer_quant_config.quant_type
+        if should_skip_online_quant(
+            source_quant_type, self.params_dtype, online_quant_config
+        ):
+            return
+
+        quant_func = get_hip_quant(online_quant_type)
         assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
             f"Unsupported source quant_type for MoE online quantization: "
             f"{source_quant_type} (layer={self.layer_name})"
