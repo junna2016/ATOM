@@ -25,3 +25,10 @@ def apply_attention_mha_rtpllm_patch() -> None:
         "Applied RTP-LLM attention patch: atom.model_ops.Attention -> RTPFullAttention."
     )
     _PATCHED = True
+
+
+def apply_attention_v4_rtpllm_patch() -> None:
+    """Monkey-patch DeepseekV4Attention for rtpllm plugin mode."""
+    from .rtp_v4_attention import apply_attention_v4_rtpllm_patch as _apply
+
+    _apply()
