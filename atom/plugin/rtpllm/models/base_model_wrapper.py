@@ -4,7 +4,7 @@ Loaded via:
     RTP_LLM_EXTERNAL_MODEL_PACKAGES=atom.plugin.rtpllm.models
 
 This module intentionally keeps runtime behavior compatible with rtp-llm's
-native qwen3.5-moe implementation while providing a plugin entrypoint that can
+native implementations while providing a plugin entrypoint that can
 be extended with ATOM-specific logic later.
 """
 
@@ -16,6 +16,7 @@ from rtp_llm.model_factory_register import (
 
 from atom.plugin.rtpllm.models.glm5 import ATOMGlm5Moe
 from atom.plugin.rtpllm.models.qwen3_5 import ATOMQwen35Moe
+from atom.plugin.rtpllm.models.deepseek_v4 import ATOMDeepSeekV4
 
 
 def _register_atom_qwen35_moe() -> None:
@@ -36,5 +37,12 @@ def _register_atom_glm5_moe() -> None:
     _hf_architecture_2_ft["GlmMoeDsaForCausalLM"] = "glm_5"
 
 
+def _register_atom_deepseek_v4() -> None:
+    """Register ATOM's rtp-llm model hook for DeepSeek-V4."""
+    register_model("atom_deepseek_v4", ATOMDeepSeekV4, [])
+    _model_factory["deepseek_v4"] = ATOMDeepSeekV4
+    _hf_architecture_2_ft["DeepseekV4ForCausalLM"] = "deepseek_v4"
+
 _register_atom_qwen35_moe()
 _register_atom_glm5_moe()
+_register_atom_deepseek_v4()
