@@ -1063,6 +1063,8 @@ class Compressor(nn.Module):
         )
 
 
+
+
 class Indexer(nn.Module):
     """Selects top-k compressed KV positions for sparse attention via learned scoring.
 
@@ -2827,8 +2829,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config: Config, prefix: str = "") -> None:
+    def __init__(self, atom_config: Config = None, config: Config = None, prefix: str = "") -> None:
         super().__init__()
+        config = atom_config if atom_config is not None else config
         self.atom_config = config
         self.hf_config = config.hf_config
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
@@ -2899,7 +2902,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
-        return self.model(input_ids, positions)
+        h = self.model(input_ids, positions)
+
+        return h
 
     def compute_logits(
         self,
