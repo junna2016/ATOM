@@ -23,7 +23,12 @@ def __getattr__(name):
         from .attention_switch import apply_attention_mha_rtpllm_patch
 
         return apply_attention_mha_rtpllm_patch
+    if name == "apply_attention_v4_rtpllm_patch":
+        from .attention_switch import apply_attention_v4_rtpllm_patch
+
+        return apply_attention_v4_rtpllm_patch
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 
 __all__ = [
@@ -34,4 +39,5 @@ __all__ = [
     "apply_attention_gdn_rtpllm_patch",
     "apply_attention_mha_rtpllm_patch",
     "apply_attention_mla_rtpllm_patch",
+    "apply_attention_v4_rtpllm_patch",
 ]
