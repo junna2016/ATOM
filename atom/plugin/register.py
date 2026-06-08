@@ -9,6 +9,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGenerationTextOnly,
     Qwen3_5ForConditionalGenerationTextOnly,
 )
+
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
 
@@ -48,6 +49,14 @@ if is_sglang():
             # sglang's native model and failed weight loading on the excluded
             # (BF16) attention projections.
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
+        }
+    )
+
+if is_rtpllm():
+    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+    _ATOM_SUPPORTED_MODELS.update(
+        {
+            "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
         }
     )
 
