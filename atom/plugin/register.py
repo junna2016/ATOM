@@ -1,28 +1,43 @@
 import logging
 
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
-from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
-from atom.models.qwen3_5 import (
-    Qwen3_5MoeForConditionalGenerationTextOnly,
-    Qwen3_5ForConditionalGenerationTextOnly,
-)
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
 
 logger = logging.getLogger("atom")
 
-_ATOM_SUPPORTED_MODELS = {
-    "Qwen3ForCausalLM": Qwen3ForCausalLM,
-    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
-    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
-    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
-    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
-}
+# Graceful imports: not all model dependencies may be available in every
+# deployment (e.g., specific transformers version for glm4_moe, or aiter
+# version for certain ops). Missing models are skipped with a warning.
+_ATOM_SUPPORTED_MODELS = {}
+
+
+def _try_register(arch_name, module_path, class_name):
+    try:
+        import importlib
+
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        _ATOM_SUPPORTED_MODELS[arch_name] = cls
+    except (ImportError, AttributeError) as e:
+        logger.warning("Skipping %s registration: %s", arch_name, e)
+
+
+_try_register("Qwen3ForCausalLM", "atom.models.qwen3", "Qwen3ForCausalLM")
+_try_register("Qwen3MoeForCausalLM", "atom.models.qwen3_moe", "Qwen3MoeForCausalLM")
+_try_register("Glm4MoeForCausalLM", "atom.models.glm4_moe", "Glm4MoeForCausalLM")
+_try_register("DeepseekV3ForCausalLM", "atom.models.deepseek_v2", "DeepseekV3ForCausalLM")
+_try_register("DeepseekV4ForCausalLM", "atom.models.deepseek_v4", "DeepseekV4ForCausalLM")
+_try_register("MiniMaxM2ForCausalLM", "atom.models.minimax_m2", "MiniMaxM2ForCausalLM")
+_try_register(
+    "Qwen3_5MoeForConditionalGeneration",
+    "atom.models.qwen3_5",
+    "Qwen3_5MoeForConditionalGenerationTextOnly",
+)
+_try_register(
+    "Qwen3_5ForConditionalGeneration",
+    "atom.models.qwen3_5",
+    "Qwen3_5ForConditionalGenerationTextOnly",
+)
 
 if is_sglang():
     from atom.models.qwen3_next import Qwen3NextForCausalLM
