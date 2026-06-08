@@ -40,6 +40,14 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
+    build_v4_kv_cache_tensors,
+    v4_kv_cache_signature,
+    is_v4_model,
+    get_v4_compress_ratios,
+    build_region_to_group_map,
+    build_v4_block_tables,
+)
 
 
 @dataclass
@@ -1602,19 +1610,39 @@ class RTPForwardContext:
             cg_max_seq_len=int(cg_max_seq_len),
             cg_bufs=cg_bufs,
         )
-        kv_cache_signature = cls._kv_cache_signature(
-            runtime=runtime,
-            layer_maps=resolved_layer_maps,
-        )
-        kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
-        cached_signature = getattr(runtime, "_rtp_kv_cache_signature", None)
-        if kv_cache_data is None or cached_signature != kv_cache_signature:
-            kv_cache_data = cls._build_kv_cache_tensors(
+
+        # V4 multi-region KV cache path vs standard single-region path
+        _is_v4 = is_v4_model(runtime)
+        if _is_v4:
+            v4_ratios = get_v4_compress_ratios(runtime)
+            kv_cache_sig = v4_kv_cache_signature(runtime, v4_ratios)
+            kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
+            cached_signature = getattr(runtime, "_rtp_kv_cache_signature", None)
+            if kv_cache_data is None or cached_signature != kv_cache_sig:
+                kv_cache_data = build_v4_kv_cache_tensors(runtime, v4_ratios)
+                runtime._rtp_kv_cache_data = kv_cache_data
+                runtime._rtp_kv_cache_signature = kv_cache_sig
+            # Stash V4-specific metadata on attn_metadata for Phase 3 attention adapter
+            region_to_group = build_region_to_group_map(runtime.kv_cache)
+            v4_block_tables = build_v4_block_tables(attn_inputs, region_to_group)
+            # These will be read by the V4 attention adapter in Phase 3
+            attn_metadata.v4_region_to_group = region_to_group
+            attn_metadata.v4_block_tables = v4_block_tables
+            attn_metadata.v4_compress_ratios = v4_ratios
+        else:
+            kv_cache_sig = cls._kv_cache_signature(
                 runtime=runtime,
                 layer_maps=resolved_layer_maps,
             )
-            runtime._rtp_kv_cache_data = kv_cache_data
-            runtime._rtp_kv_cache_signature = kv_cache_signature
+            kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
+            cached_signature = getattr(runtime, "_rtp_kv_cache_signature", None)
+            if kv_cache_data is None or cached_signature != kv_cache_sig:
+                kv_cache_data = cls._build_kv_cache_tensors(
+                    runtime=runtime,
+                    layer_maps=resolved_layer_maps,
+                )
+                runtime._rtp_kv_cache_data = kv_cache_data
+                runtime._rtp_kv_cache_signature = kv_cache_sig
         batch_size = int(attn_metadata.plugin_metadata.num_prefills)
         if batch_size <= 0:
             batch_size = int(attn_metadata.plugin_metadata.num_decodes)
