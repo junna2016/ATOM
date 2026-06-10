@@ -1098,6 +1098,8 @@ class Compressor(nn.Module):
         )
 
 
+
+
 class Indexer(nn.Module):
     """Selects top-k compressed KV positions for sparse attention via learned scoring.
 
@@ -2847,7 +2849,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         else:
             ctx.context.input_ids = input_ids
-        return self.model(input_ids, positions)
+        h = self.model(input_ids, positions)
+
+        return h
 
     def compute_logits(
         self,
