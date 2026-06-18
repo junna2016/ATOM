@@ -781,31 +781,13 @@ def _bind_v4_compressor_views(
         kv_raw = kv_pool.kv_cache_base.view(torch.bfloat16)
         compressor.kv_cache = kv_raw.reshape(-1, k_per_block, head_dim)
 
-    # State: [B, entries * state_dim * 2] fp32 → split kv/score
-    if state_pool is not None:
-        state_base = state_pool.kv_cache_base  # already fp32
-        B = state_base.shape[0]
-        if ratio == 4:
-            entries = (1 + (1 if ratio == 4 else 0)) * ratio  # state ring size
-            state_dim = 2 * head_dim  # coff=2, 1024
-        else:
-            entries = (1 + (1 if ratio == 4 else 0)) * ratio  # state ring size
-            state_dim = head_dim  # coff=1, 512
-        # State is interleaved [kv, score] per entry. Full pool is huge (1.5GB for HCA).
-        # Only extract slots used by current batch via state_slot_mapping.
-        from atom.utils.forward_context import get_forward_context
-        fc_inner = get_forward_context()
-        ssm = getattr(fc_inner.attn_metadata, "state_slot_mapping", None)
-        state_4d = state_base.reshape(B, entries, 2, state_dim)
-        if ssm is not None and ssm.numel() > 0 and ssm.numel() < B:
-            # Extract only needed slots (tiny copy)
-            needed = state_4d[ssm.long()]  # [bs, entries, 2, state_dim]
-            compressor.kv_state = needed[:, :, 0, :].contiguous()
-            compressor.score_state = needed[:, :, 1, :].contiguous()
-        else:
-            # Fallback: full pool (may OOM for large pools)
-            compressor.kv_state = state_4d[:, :, 0, :].contiguous()
-            compressor.score_state = state_4d[:, :, 1, :].contiguous()
+    # State persistence: fused_compress_attn requires contiguous state, but pool
+    # views are non-contiguous (interleaved [kv,score] layout). Shadow buffers
+    # from _ensure_v4_native_buffers are persistent module attributes that
+    # accumulate compressor state across decode steps. Do NOT overwrite them
+    # from pool — .contiguous() creates a copy, so in-place updates during
+    # forward_impl would be lost and never written back to pool.
+    # Skip state bind entirely; shadow buffers handle state persistence.
 
 
 def _bind_v4_indexer_views(
