@@ -2,8 +2,12 @@ import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
+try:
+    from atom.models.glm4_moe import Glm4MoeForCausalLM
+except (ImportError, ModuleNotFoundError):
+    Glm4MoeForCausalLM = None
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
+from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGenerationTextOnly,
@@ -18,10 +22,11 @@ logger = logging.getLogger("atom")
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
+    **({"Glm4MoeForCausalLM": Glm4MoeForCausalLM} if Glm4MoeForCausalLM else {}),
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
+    "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
     "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
@@ -52,13 +57,7 @@ if is_sglang():
         }
     )
 
-if is_rtpllm():
-    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
-    _ATOM_SUPPORTED_MODELS.update(
-        {
-            "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
-        }
-    )
+
 
 
 def _register_custom_attention_to_sglang() -> None:

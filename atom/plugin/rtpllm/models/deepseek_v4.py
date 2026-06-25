@@ -131,8 +131,8 @@ class _ATOMAttnPyObj:
         ssm_np = np.arange(bs, dtype=np.int32)
 
         # batch_id_per_token: for decode, token t belongs to seq t
-        batch_id_np = np.full(max_bs, -1, dtype=np.int64)
-        batch_id_np[:bs] = np.arange(bs, dtype=np.int64)
+        batch_id_np = np.full(max_bs, -1, dtype=np.int32)
+        batch_id_np[:bs] = np.arange(bs, dtype=np.int32)
 
         # n_committed
         win = int(bufs["_win"])
@@ -176,7 +176,7 @@ class _ATOMAttnPyObj:
             torch.from_numpy(block_ids_np).to(dtype=torch.int64), non_blocking=True
         )
         bufs["batch_id"][:max_bs].copy_(
-            torch.from_numpy(batch_id_np).to(dtype=torch.int64), non_blocking=True
+            torch.from_numpy(batch_id_np).to(dtype=torch.int32), non_blocking=True
         )
         bufs["n_csa"][:bs].copy_(
             torch.from_numpy(n_csa_np).to(dtype=torch.int32), non_blocking=True
@@ -363,6 +363,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                 0, max_bs + 1, device=device, dtype=torch.int32
             ),
             "seq_id": torch.arange(0, max_bs, device=device, dtype=torch.int64),
+            "seq_id_i32": torch.arange(0, max_bs, device=device, dtype=torch.int32),
             "block_col": torch.empty(max_bs, device=device, dtype=torch.int32),
             "block_col_i64": torch.empty(max_bs, device=device, dtype=torch.int64),
             "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
@@ -397,7 +398,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             # Per-token / per-seq metadata (decode: 1 token/seq → max_bs tokens)
             "positions": torch.zeros(max_bs, device=device, dtype=torch.int64),
             "state_slot": torch.zeros(max_bs, device=device, dtype=torch.int32),
-            "batch_id": torch.full((max_bs,), -1, device=device, dtype=torch.int64),
+            "batch_id": torch.full((max_bs,), -1, device=device, dtype=torch.int32),
             "n_csa": torch.zeros(max_bs, device=device, dtype=torch.int32),
             "n_hca": torch.zeros(max_bs, device=device, dtype=torch.int32),
             # Ragged indptrs [max_bs + 1]
@@ -550,6 +551,13 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             logger.warning("ATOM V4 warmup eager forward failed (non-fatal): %s", e)
 
     def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        try:
+            return self._forward_impl(inputs, fmha_impl)
+        except Exception as e:
+            logger.error("ATOM V4 forward FATAL: %s", e, exc_info=True)
+            raise
+
+    def _forward_impl(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
         model_device = self._model_device
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
 

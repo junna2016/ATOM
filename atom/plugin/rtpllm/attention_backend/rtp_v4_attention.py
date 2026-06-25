@@ -432,7 +432,7 @@ def _build_eager_decode_with_triton(attn_md, attn_inputs, v4_ratios, v4_block_ta
     # --- Allocate GPU tensors ---
     positions_gpu = torch.from_numpy(positions_np).to(dtype=torch.int64, device=device)
     state_slot_gpu = torch.from_numpy(ssm_np).to(dtype=torch.int32, device=device)
-    batch_id_gpu = torch.arange(bs, dtype=torch.int64, device=device)
+    batch_id_gpu = torch.arange(bs, dtype=torch.int32, device=device)
     n_hca_gpu = torch.from_numpy(n_hca_np).to(dtype=torch.int32, device=device)
 
     indptr_swa_gpu = torch.from_numpy(swa_indptr_np).to(dtype=torch.int32, device=device)
