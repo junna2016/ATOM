@@ -2,7 +2,10 @@ import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
+try:
+    from atom.models.glm4_moe import Glm4MoeForCausalLM
+except (ImportError, ModuleNotFoundError):
+    Glm4MoeForCausalLM = None
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.models.qwen3_5 import (
@@ -18,7 +21,7 @@ logger = logging.getLogger("atom")
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
+    **({"Glm4MoeForCausalLM": Glm4MoeForCausalLM} if Glm4MoeForCausalLM else {}),
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,

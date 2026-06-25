@@ -131,8 +131,8 @@ class _ATOMAttnPyObj:
         ssm_np = np.arange(bs, dtype=np.int32)
 
         # batch_id_per_token: for decode, token t belongs to seq t
-        batch_id_np = np.full(max_bs, -1, dtype=np.int64)
-        batch_id_np[:bs] = np.arange(bs, dtype=np.int64)
+        batch_id_np = np.full(max_bs, -1, dtype=np.int32)
+        batch_id_np[:bs] = np.arange(bs, dtype=np.int32)
 
         # n_committed
         win = int(bufs["_win"])
@@ -176,7 +176,7 @@ class _ATOMAttnPyObj:
             torch.from_numpy(block_ids_np).to(dtype=torch.int64), non_blocking=True
         )
         bufs["batch_id"][:max_bs].copy_(
-            torch.from_numpy(batch_id_np).to(dtype=torch.int64), non_blocking=True
+            torch.from_numpy(batch_id_np).to(dtype=torch.int32), non_blocking=True
         )
         bufs["n_csa"][:bs].copy_(
             torch.from_numpy(n_csa_np).to(dtype=torch.int32), non_blocking=True
@@ -397,7 +397,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             # Per-token / per-seq metadata (decode: 1 token/seq → max_bs tokens)
             "positions": torch.zeros(max_bs, device=device, dtype=torch.int64),
             "state_slot": torch.zeros(max_bs, device=device, dtype=torch.int32),
-            "batch_id": torch.full((max_bs,), -1, device=device, dtype=torch.int64),
+            "batch_id": torch.full((max_bs,), -1, device=device, dtype=torch.int32),
             "n_csa": torch.zeros(max_bs, device=device, dtype=torch.int32),
             "n_hca": torch.zeros(max_bs, device=device, dtype=torch.int32),
             # Ragged indptrs [max_bs + 1]
