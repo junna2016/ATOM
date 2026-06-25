@@ -333,6 +333,33 @@ def _ensure_v4_native_buffers(attn_module: Any, num_slots: int, device: torch.de
                  attn_module.layer_id, num_slots, window_size, head_dim, ratio)
 
 
+def _reset_v4_state_all(attn_module: Any) -> None:
+    """Zero ALL V4 state caches for a new request (full cleanup).
+
+    Called during prefill to prevent stale compressor/indexer state from
+    a previous request from corrupting the softmax-pool computation.
+    Zeros the entire buffer rather than selective slots because decode
+    uses compact indices [0..bs-1] while prefill uses block_id indices —
+    selective reset by block_id misses the stale compact-indexed state.
+    """
+    swa = getattr(attn_module, "swa_kv", None)
+    if isinstance(swa, torch.Tensor):
+        swa.zero_()
+    compact_swa = getattr(attn_module, "_compact_swa_kv", None)
+    if compact_swa is not None and compact_swa is not swa and isinstance(compact_swa, torch.Tensor):
+        compact_swa.zero_()
+    for compressor in (
+        getattr(attn_module, "compressor", None),
+        getattr(getattr(attn_module, "indexer", None), "compressor", None),
+    ):
+        if compressor is None:
+            continue
+        if isinstance(getattr(compressor, "kv_state", None), torch.Tensor):
+            compressor.kv_state.zero_()
+        if isinstance(getattr(compressor, "score_state", None), torch.Tensor):
+            compressor.score_state.fill_(float("-inf"))
+
+
 def _build_eager_decode_with_triton(attn_md, attn_inputs, v4_ratios, v4_block_tables,
                                      region_to_group, device, window_size=128,
                                      pool_swa_pages=0, index_topk=1024):
@@ -1479,21 +1506,17 @@ def _patched_v4_forward(self, x, positions):
                     if _half == _ring * _dim:
                         compressor.kv_state[:active_bs] = _gathered[:, :_half].reshape(active_bs, _ring, _dim)
                         compressor.score_state[:active_bs] = _gathered[:, _half:].reshape(active_bs, _ring, _dim)
-                        # DIAG: print state gather info for first CSA layer
                         if self.layer_id == 2:
-                            _kv_sum = float(compressor.kv_state[0].sum())
-                            _sc_sum = float(compressor.score_state[0].sum())
-                            _pool_sum = float(_gathered[0].sum())
-                            logger.info("DECODE STATE GATHER layer=%d: state_bid=%s pool_sum=%.4f kv_sum=%.4f sc_sum=%.4f",
-                                        self.layer_id, _state_block_ids.tolist(), _pool_sum, _kv_sum, _sc_sum)
+                            logger.debug("DECODE STATE GATHER layer=%d: state_bid=%s",
+                                         self.layer_id, _state_block_ids.tolist())
                     else:
                         if self.layer_id == 2:
-                            logger.warning("DECODE STATE GATHER SKIP layer=%d: half=%d ring*dim=%d",
-                                           self.layer_id, _half, _ring * _dim)
+                            logger.debug("DECODE STATE GATHER SKIP layer=%d: half=%d ring*dim=%d",
+                                         self.layer_id, _half, _ring * _dim)
             else:
                 if self.layer_id == 2:
-                    logger.warning("DECODE STATE: no state_bt or cache_entry. state_bt=%s cache_entry=%s",
-                                   _state_bt is not None, cache_entry is not None)
+                    logger.debug("DECODE STATE: no state_bt or cache_entry. state_bt=%s cache_entry=%s",
+                                 _state_bt is not None, cache_entry is not None)
 
         # Gather: pool[block_ids] → compact swa_kv[0..bs-1]
         _pool_swa = getattr(self, "_rtp_pool_swa_kv", None)
@@ -1655,6 +1678,13 @@ def _patched_v4_forward(self, x, positions):
                 _pf_comp.score_state = torch.full(
                     (_pf_max_slot, _pf_comp.score_state.shape[1], _pf_comp.score_state.shape[2]),
                     float('-inf'), dtype=torch.float32, device=x.device)
+            else:
+                # Buffer already large enough — zero ALL state to clear any
+                # stale compressor state from a previous request. Full reset
+                # is needed because decode uses compact indices [0..bs-1]
+                # while prefill uses block_id indices — partial reset would
+                # miss the stale compact-indexed state left by prior decode.
+                _reset_v4_state_all(self)
             # Also check indexer compressor
             if ratio == 4:
                 _pf_idx = getattr(self, "indexer", None)
