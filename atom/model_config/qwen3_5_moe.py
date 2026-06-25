@@ -16,7 +16,16 @@
 # limitations under the License.
 """Qwen3.5-MoE model configuration"""
 
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.configuration_utils import PretrainedConfig
+
+try:
+    from transformers.configuration_utils import layer_type_validation
+except ImportError:
+    def layer_type_validation(layer_types, num_hidden_layers):
+        if layer_types is not None and len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"layer_types length ({len(layer_types)}) != num_hidden_layers ({num_hidden_layers})"
+            )
 
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
