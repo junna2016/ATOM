@@ -183,6 +183,7 @@ def _kv_splits_heuristic(
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    compress_kv_ptr,  # [compress_pages, D] bf16/fp16 (split-KV second buffer)
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
@@ -193,12 +194,15 @@ def _paged_decode_fused_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
+    ckv_stride_n,  # row stride of compress_kv (used only when SPLIT_KV)
+    ckv_stride_d,  # col stride of compress_kv
     ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
     out_stride_t,
     out_stride_h,
     out_stride_d,
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
+    swa_pages,  # boundary: slot < swa_pages → unified_kv, >= → compress_kv
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -207,6 +211,7 @@ def _paged_decode_fused_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    SPLIT_KV: tl.constexpr,  # True → dual-pointer mode (separate SWA + compress pools)
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -263,13 +268,34 @@ def _paged_decode_fused_kernel(
             other=0,  # any in-bounds slot; the read is masked out below
         )
 
-        kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
+        if SPLIT_KV:
+            # Dual-pointer: slots < swa_pages read from unified_kv (SWA pool),
+            # slots >= swa_pages read from compress_kv (CSA/HCA pool).
+            is_compress = slot >= swa_pages
+            adj_slot = tl.where(is_compress, slot - swa_pages, slot)
+            kv_swa = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :] & (~is_compress[:, None]),
+                other=0.0,
+            )
+            kv_cmp = tl.load(
+                compress_kv_ptr
+                + adj_slot[:, None] * ckv_stride_n
+                + d_offs[None, :] * ckv_stride_d,
+                mask=valid[:, None] & d_mask[None, :] & is_compress[:, None],
+                other=0.0,
+            )
+            kv_raw = kv_swa + kv_cmp
+        else:
+            kv_raw = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
         if QUANT_KV:
             # 1xGROUP_SIZE block-scale dequant via direct broadcast load —
             # avoids the explicit reshape + 3D intermediate that pinned
@@ -335,6 +361,7 @@ def _paged_decode_fused_kernel(
 def _paged_decode_split_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    compress_kv_ptr,  # [compress_pages, D] bf16/fp16 (split-KV second buffer)
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
@@ -346,6 +373,8 @@ def _paged_decode_split_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
+    ckv_stride_n,  # row stride of compress_kv (used only when SPLIT_KV)
+    ckv_stride_d,  # col stride of compress_kv
     ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
     mp_stride_t,
     mp_stride_k,
@@ -361,12 +390,14 @@ def _paged_decode_split_kernel(
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     qk_scale,  # = softmax_scale * LOG2E
+    swa_pages,  # boundary for SPLIT_KV
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+    SPLIT_KV: tl.constexpr,  # True → dual-pointer mode
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -429,13 +460,32 @@ def _paged_decode_split_kernel(
             other=0,  # any in-bounds slot; masked out below
         )
 
-        kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
+        if SPLIT_KV:
+            is_compress = slot >= swa_pages
+            adj_slot = tl.where(is_compress, slot - swa_pages, slot)
+            kv_swa = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :] & (~is_compress[:, None]),
+                other=0.0,
+            )
+            kv_cmp = tl.load(
+                compress_kv_ptr
+                + adj_slot[:, None] * ckv_stride_n
+                + d_offs[None, :] * ckv_stride_d,
+                mask=valid[:, None] & d_mask[None, :] & is_compress[:, None],
+                other=0.0,
+            )
+            kv_raw = kv_swa + kv_cmp
+        else:
+            kv_raw = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
         if QUANT_KV:
             scales_full = tl.load(
                 kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
@@ -629,6 +679,8 @@ def _sparse_attn_v4_paged_decode_triton(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    compress_kv: torch.Tensor | None = None,
+    swa_pages: int = 0,
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
@@ -652,6 +704,7 @@ def _sparse_attn_v4_paged_decode_triton(
         )
 
     quant_kv = kv_scales is not None
+    split_kv = compress_kv is not None and swa_pages > 0
     if quant_kv:
         if unified_kv.dtype != _FP8_DTYPE:
             raise RuntimeError(
@@ -718,6 +771,16 @@ def _sparse_attn_v4_paged_decode_triton(
         # because the QUANT_KV=False branch elides the dequant code).
         num_groups_arg = 1
 
+    # Compress KV strides (dummy when SPLIT_KV=False)
+    if split_kv:
+        ckv_stride_n_arg = compress_kv.stride(0)
+        ckv_stride_d_arg = compress_kv.stride(1)
+        compress_kv_arg = compress_kv
+    else:
+        ckv_stride_n_arg = 1
+        ckv_stride_d_arg = 1
+        compress_kv_arg = unified_kv.new_empty(1)  # dummy
+
     # Fast path: when the base grid (T * n_head_blocks) already saturates the
     # GPU, kv_splits=1 and a single-pass fused kernel beats split+reduce by
     # skipping the partial-buffer alloc and the second kernel launch.
@@ -726,6 +789,7 @@ def _sparse_attn_v4_paged_decode_triton(
         _paged_decode_fused_kernel[grid_fused](
             q,
             unified_kv,
+            compress_kv_arg,
             kv_scales_arg,
             kv_indices,
             kv_indptr,
@@ -736,12 +800,15 @@ def _sparse_attn_v4_paged_decode_triton(
             q.stride(2),
             unified_kv.stride(0),
             unified_kv.stride(1),
+            ckv_stride_n_arg,
+            ckv_stride_d_arg,
             ks_stride_n_arg,
             out.stride(0),
             out.stride(1),
             out.stride(2),
             qk_scale,
             LOG2E,
+            swa_pages,
             H,
             D,
             BLOCK_H=block_h,
@@ -750,6 +817,7 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            SPLIT_KV=split_kv,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -771,6 +839,7 @@ def _sparse_attn_v4_paged_decode_triton(
     _paged_decode_split_kernel[grid_split](
         q,
         unified_kv,
+        compress_kv_arg,
         kv_scales_arg,
         kv_indices,
         kv_indptr,
@@ -782,6 +851,8 @@ def _sparse_attn_v4_paged_decode_triton(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
+        ckv_stride_n_arg,
+        ckv_stride_d_arg,
         ks_stride_n_arg,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -797,12 +868,14 @@ def _sparse_attn_v4_paged_decode_triton(
         D,
         kv_splits,
         qk_scale,
+        swa_pages,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
+        SPLIT_KV=split_kv,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -910,8 +983,15 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    compress_kv: torch.Tensor | None = None,
+    swa_pages: int = 0,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
+
+    When ``compress_kv`` is provided with ``swa_pages > 0``, enables split-KV
+    mode: slots < swa_pages read from ``unified_kv``, slots >= swa_pages read
+    from ``compress_kv`` at offset (slot - swa_pages). This allows separate
+    SWA and compress memory pools without concatenation.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
@@ -925,6 +1005,8 @@ def sparse_attn_v4_paged_decode(
             attn_sink,
             softmax_scale,
             kv_scales=kv_scales,
+            compress_kv=compress_kv,
+            swa_pages=swa_pages,
         )
     return sparse_attn_v4_paged_decode_reference(
         q,
@@ -935,3 +1017,4 @@ def sparse_attn_v4_paged_decode(
         softmax_scale,
         kv_scales=kv_scales,
     )
+
