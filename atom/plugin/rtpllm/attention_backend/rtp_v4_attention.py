@@ -497,7 +497,7 @@ def _build_eager_decode_with_triton(attn_md, attn_inputs, v4_ratios, v4_block_ta
     # cu_seqlens_q for decode: [0, 1, 2, ..., bs]
     attn_md.cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device=device)
     attn_md.max_seqlen_q = 1
-    attn_md.batch_id_per_token = batch_id_gpu.to(torch.int32)
+    attn_md.batch_id_per_token = batch_id_gpu
 
     # --- indexer_meta (for CSA layers' topk selection in decode) ---
     attn_md.indexer_meta = {
@@ -1214,7 +1214,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         attn_md.cu_seqlens_q = torch.arange(max_bs + 1, device=x.device, dtype=torch.int32)
         bufs["_cu_seqlens_q"] = attn_md.cu_seqlens_q
     attn_md.max_seqlen_q = 1
-    attn_md.batch_id_per_token = bufs["batch_id"]
+    attn_md.batch_id_per_token = bufs["batch_id"]  # int32 for forward_impl (qk_norm_rope + csa_translate_pack)
     attn_md.n_committed_csa_per_seq = bufs["n_csa"][:active_bs]
     attn_md.kv_indices_swa = bufs["idx_swa"]
     attn_md.kv_indices_csa = bufs["idx_csa"]

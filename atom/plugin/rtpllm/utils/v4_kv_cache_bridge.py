@@ -200,7 +200,8 @@ def build_v4_block_tables(
         Only includes regions that have an associated group in region_to_group.
     """
     block_tables: Dict[int, Optional[torch.Tensor]] = {}
-    for region in (SWA_KV, CSA_KV, HCA_KV, INDEXER_KV):
+    for region in (SWA_KV, CSA_KV, HCA_KV, INDEXER_KV,
+                   CSA_STATE, HCA_STATE, INDEXER_STATE):
         bt = select_block_table_for_region(attn_inputs, region, region_to_group)
         if bt is not None:
             block_tables[region] = bt
