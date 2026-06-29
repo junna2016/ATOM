@@ -125,6 +125,7 @@ class _ATOMAttnPyObj:
         # swa_kv gather/scatter (remapping pool ↔ compact buffer).
         if swa_bt is not None and swa_bt.numel() >= bs:
             block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
+            block_ids_np = np.maximum(block_ids_np, 0)  # guard -1 (freed block)
         else:
             block_ids_np = np.arange(bs, dtype=np.int32)
         # Compact slot mapping for compressor state: always [0, 1, ..., bs-1]
@@ -175,6 +176,65 @@ class _ATOMAttnPyObj:
         _block_ids_buf[:bs].copy_(
             torch.from_numpy(block_ids_np).to(dtype=torch.int64), non_blocking=True
         )
+
+        # --- SWA gather: pool → compact (OUTSIDE graph, first step only) ---
+        # The compact SWA buffer is NOT populated by prefill (prefill writes to
+        # pool). We must gather pool[block_id] → compact ONCE at the start of
+        # each new request. Subsequent decode steps are self-maintaining via
+        # SWA write in forward_impl. Gathering every step would OVERWRITE the
+        # SWA writes from previous steps, so we only gather when block_ids change.
+        _prev_bids = bufs.get("_prev_gather_block_ids", None)
+        _curr_bid_tuple = tuple(block_ids_np[:bs].tolist())
+        if _prev_bids is None or _prev_bids != _curr_bid_tuple:
+            bufs["_prev_gather_block_ids"] = _curr_bid_tuple
+            _bid_gpu = _block_ids_buf[:bs]
+            # Also get STATE block tables for compressor state gather
+            _state_bts = {}
+            try:
+                from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import CSA_STATE, HCA_STATE
+                for _sr in (CSA_STATE, HCA_STATE):
+                    _sbt = select_block_table_for_region(attn_inputs, _sr, region_to_group)
+                    if _sbt is not None:
+                        _state_bts[_sr] = _sbt
+            except Exception:
+                pass
+            try:
+                from atom.models.deepseek_v4 import DeepseekV4Attention
+                kv_cache_data = getattr(rt, "_rtp_kv_cache_data", None)
+                for module in rt.model.modules():
+                    if not isinstance(module, DeepseekV4Attention):
+                        continue
+                    # SWA gather: pool → compact swa_kv
+                    _compact = getattr(module, "_compact_swa_kv", None)
+                    _pool = getattr(module, "_rtp_pool_swa_kv", None)
+                    if _compact is not None and _pool is not None:
+                        _compact[:bs].copy_(_pool.index_select(0, _bid_gpu))
+                    # STATE gather: pool → compact kv_state/score_state
+                    _comp = getattr(module, "compressor", None)
+                    _ratio = getattr(module, "compress_ratio", 0)
+                    if _comp is not None and _ratio != 0 and kv_cache_data is not None:
+                        _sr = CSA_STATE if _ratio == 4 else HCA_STATE
+                        _sbt = _state_bts.get(_sr)
+                        _layer_id = getattr(module, "layer_id", -1)
+                        _ce = kv_cache_data.get(f"layer_{_layer_id}")
+                        _sp_name = "CSA_STATE" if _ratio == 4 else "HCA_STATE"
+                        _sp = _ce.k_cache.get(_sp_name) if _ce and isinstance(_ce.k_cache, dict) else None
+                        if _sbt is not None and _sp is not None:
+                            _sp_raw = _sp.kv_cache_base.view(torch.float32)
+                            _n_blk = _sp_raw.shape[0]
+                            _elems = _sp_raw.numel() // _n_blk
+                            _sp_view = _sp_raw.reshape(_n_blk, _elems)
+                            _s_bids = _sbt[:bs, 0].to(torch.int64)
+                            _half = _elems // 2
+                            _ring = _comp.kv_state.shape[1]
+                            _dim = _comp.kv_state.shape[2]
+                            if _half == _ring * _dim:
+                                _gathered = _sp_view[_s_bids]
+                                _comp.kv_state[:bs] = _gathered[:, :_half].reshape(bs, _ring, _dim)
+                                _comp.score_state[:bs] = _gathered[:, _half:].reshape(bs, _ring, _dim)
+            except Exception as e:
+                logger.warning("SWA/STATE gather failed: %s", e)
+
         bufs["batch_id"][:max_bs].copy_(
             torch.from_numpy(batch_id_np).to(dtype=torch.int32), non_blocking=True
         )
@@ -225,31 +285,8 @@ class _ATOMAttnPyObj:
         # Stash active batch size for the graph-mode forward path
         bufs["_active_bs"] = bs
 
-        # --- Detect new request: reset compressor state for compact slots ---
-        # Compact slots are reused across requests. If block_ids change, it's a
-        # new request — state[0..bs-1] has stale data from previous request.
-        # Reset to initial values (zeros for kv_state, -inf for score_state).
-        # This runs OUTSIDE the graph (in prepare_cuda_graph), so it's safe.
-        _prev_bids = bufs.get("_prev_block_ids_hash", None)
-        _curr_hash = int(block_ids_np.sum()) if bs > 0 else 0
-        if _prev_bids is None or _prev_bids != _curr_hash:
-            bufs["_prev_block_ids_hash"] = _curr_hash
-            # Reset compressor state on all attention layers
-            try:
-                for module in rt.model.modules():
-                    if hasattr(module, 'compressor') and module.compressor is not None:
-                        comp = module.compressor
-                        if hasattr(comp, 'kv_state') and comp.kv_state.shape[0] >= bs:
-                            comp.kv_state[:bs].zero_()
-                            comp.score_state[:bs].fill_(float('-inf'))
-                    # Also reset indexer's inner compressor
-                    if hasattr(module, 'indexer') and module.indexer is not None:
-                        idx_comp = getattr(module.indexer, 'compressor', None)
-                        if idx_comp is not None and hasattr(idx_comp, 'kv_state') and idx_comp.kv_state.shape[0] >= bs:
-                            idx_comp.kv_state[:bs].zero_()
-                            idx_comp.score_state[:bs].fill_(float('-inf'))
-            except Exception as e:
-                logger.debug("State reset failed (non-fatal): %s", e)
+        # NOTE: Do NOT reset compressor state here. Prefill already handles
+        # state initialization via _reset_v4_state_all().
 
 
 class _ATOMDeepSeekV4Runtime(GptModelBase):
@@ -589,8 +626,14 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # Build int64 positions for model forward (RoPE kernel requires int64).
         # bind() needs int32 (slot_mapping). Graph mode uses pre-allocated buffer.
         if is_cuda_graph:
-            pos_i64 = self._cg_positions_i64[:positions.shape[0]]
-            pos_i64.copy_(positions)  # int32→int64 in-place, graph-safe
+            v4_bufs = getattr(self, "_cg_v4_bufs", None)
+            n_tokens = input_ids.shape[0] if input_ids is not None and input_ids.numel() > 0 else 1
+            if v4_bufs is not None and "positions" in v4_bufs:
+                pos_i64 = self._cg_positions_i64[:n_tokens]
+                pos_i64.copy_(v4_bufs["positions"][:n_tokens])
+            else:
+                pos_i64 = self._cg_positions_i64[:n_tokens]
+                pos_i64.copy_(positions)
         else:
             pos_i64 = positions.to(dtype=torch.int64)
 
