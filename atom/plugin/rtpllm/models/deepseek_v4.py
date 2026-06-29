@@ -457,17 +457,13 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         )
         self._cg_v4_bufs["_state_slot_mapping_cpu"] = np.zeros(1, dtype=np.int32)
 
-        # Pre-allocate the graph-mode cat buffer (monkey-patch working buffer).
-        # Must be large enough for max(swa + csa_compress, swa + hca_compress)
-        # so it never reallocates during capture (which would invalidate earlier
-        # layers' captured addresses).
+        # Initialize module-level pool view caches for graph-capture fallback
+        # (there is NO eager forward before graph capture in RTP-LLM).
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
             SWA_KV, CSA_KV, HCA_KV, get_pool_for_layer_region,
         )
         try:
             swa_pool = get_pool_for_layer_region(kv_cache, 0, SWA_KV)
-            # Layer 0 is often dense (ratio=0) and has NO CSA/HCA pool.
-            # Find actual CSA/HCA layers to query their pool sizes.
             compress_ratios = getattr(self, "_compress_ratios", None)
             if compress_ratios is None:
                 model = self.model
@@ -480,29 +476,18 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             csa_pool = get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV) if csa_layer_id is not None else None
             hca_pool = get_pool_for_layer_region(kv_cache, hca_layer_id, HCA_KV) if hca_layer_id is not None else None
             head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
-            swa_pages = int(swa_pool.kv_cache_base.shape[0]) * win if swa_pool else 0
-            csa_compress = (int(csa_pool.kv_cache_base.view(torch.bfloat16).numel()) // head_dim) if csa_pool else 0
-            hca_compress = (int(hca_pool.kv_cache_base.view(torch.bfloat16).numel()) // head_dim) if hca_pool else 0
-            max_unified = swa_pages + max(csa_compress, hca_compress)
-            if max_unified > 0:
-                import atom.plugin.rtpllm.attention_backend.rtp_v4_attention as _v4_attn
-                _v4_attn._graph_cat_buf = torch.empty(
-                    max_unified, head_dim, dtype=torch.bfloat16, device=device,
-                )
-                # Also initialize the module-level pool view caches so the
-                # graph-capture fallback path can find them (there is NO eager
-                # forward before graph capture in RTP-LLM).
-                if swa_pool is not None:
-                    _swa_raw = swa_pool.kv_cache_base
-                    _v4_attn._SWA_FLAT_CACHE = _swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
-                if csa_pool is not None:
-                    _v4_attn._CSA_COMPRESS_KV_CACHE = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
-                if hca_pool is not None:
-                    _v4_attn._HCA_COMPRESS_KV_CACHE = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
-                logger.info("Pre-allocated graph cat buffer: [%d, %d] (swa=%d, csa_c=%d, hca_c=%d)",
-                            max_unified, head_dim, swa_pages, csa_compress, hca_compress)
+
+            import atom.plugin.rtpllm.attention_backend.rtp_v4_attention as _v4_attn
+            if swa_pool is not None:
+                _swa_raw = swa_pool.kv_cache_base
+                _v4_attn._SWA_FLAT_CACHE = _swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
+            if csa_pool is not None:
+                _v4_attn._CSA_COMPRESS_KV_CACHE = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
+            if hca_pool is not None:
+                _v4_attn._HCA_COMPRESS_KV_CACHE = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
+            logger.info("Initialized pool view caches for graph capture fallback")
         except Exception as e:
-            logger.warning("Failed to pre-allocate graph cat buffer: %s", e)
+            logger.warning("Failed to initialize pool view caches: %s", e)
 
         self._cg_layers_prewarmed = True
 
@@ -824,4 +809,5 @@ class ATOMDeepSeekV4Mtp(DeepSeekV4Mtp):
 
     def _create_python_model(self):
         logger.warning("ATOMDeepSeekV4Mtp: MTP not yet implemented")
+
 
