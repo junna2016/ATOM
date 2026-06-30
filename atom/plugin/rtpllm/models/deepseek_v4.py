@@ -604,9 +604,18 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                     num_tokens = input_ids.numel() if input_ids is not None else 1
                     positions = torch.zeros(num_tokens, dtype=torch.int32, device=model_device)
             else:
-                # Prefill: construct sequential positions [0, 1, 2, ...]
+                # Prefill: construct per-sequence positions [0,..,L1-1, 0,..,L2-1, ...]
+                # NOT cumulative [0,..,L1+L2-1] — SWA ring buffer needs per-seq positions.
                 num_tokens = input_ids.numel() if input_ids is not None else 1
-                positions = torch.arange(num_tokens, dtype=torch.int32, device=model_device)
+                _inp_lens = getattr(attn_inputs, "input_lengths", None) if attn_inputs else None
+                if _inp_lens is not None and _inp_lens.numel() > 1:
+                    _lens_cpu = _inp_lens.cpu().tolist()
+                    positions = torch.cat([
+                        torch.arange(int(l), dtype=torch.int32, device=model_device)
+                        for l in _lens_cpu
+                    ])
+                else:
+                    positions = torch.arange(num_tokens, dtype=torch.int32, device=model_device)
 
         # Build int64 positions for model forward (RoPE kernel requires int64).
         # bind() needs int32 (slot_mapping). Graph mode uses pre-allocated buffer.
