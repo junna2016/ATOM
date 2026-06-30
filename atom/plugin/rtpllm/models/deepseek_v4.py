@@ -188,6 +188,8 @@ class _ATOMAttnPyObj:
         if _prev_bids is None or _prev_bids != _curr_bid_tuple:
             bufs["_prev_gather_block_ids"] = _curr_bid_tuple
             _bid_gpu = _block_ids_buf[:bs]
+            # Full block table for multi-block gather (prompts > win tokens)
+            swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32) if swa_bt is not None else None
             # Also get STATE block tables for compressor state gather
             _state_bts = {}
             try:
@@ -205,10 +207,33 @@ class _ATOMAttnPyObj:
                     if not isinstance(module, DeepseekV4Attention):
                         continue
                     # SWA gather: pool → compact swa_kv
+                    # For prompts > win tokens, SWA data spans multiple blocks.
+                    # We must gather the correct ring positions from each block:
+                    #   ring [0, split): from current block (latest positions)
+                    #   ring [split, win): from previous block
                     _compact = getattr(module, "_compact_swa_kv", None)
                     _pool = getattr(module, "_rtp_pool_swa_kv", None)
                     if _compact is not None and _pool is not None:
-                        _compact[:bs].copy_(_pool.index_select(0, _bid_gpu))
+                        for _si in range(bs):
+                            _pos = int(positions_np[_si])
+                            _ring_split = _pos % win
+                            _cur_col = _pos // win
+                            _prev_col = _cur_col - 1 if _cur_col > 0 else 0
+                            _cur_bid_val = int(swa_bt_cpu[_si, min(_cur_col, swa_bt_cpu.shape[1]-1)])
+                            _cur_bid_val = max(_cur_bid_val, 0)
+                            if _cur_col > 0 and _prev_col < swa_bt_cpu.shape[1]:
+                                _prev_bid_val = int(swa_bt_cpu[_si, min(_prev_col, swa_bt_cpu.shape[1]-1)])
+                                _prev_bid_val = max(_prev_bid_val, 0)
+                                # Split gather: ring [0, split) from current, [split, win) from previous
+                                if _ring_split > 0 and _cur_bid_val < _pool.shape[0]:
+                                    _compact[_si, :_ring_split].copy_(_pool[_cur_bid_val, :_ring_split])
+                                if _prev_bid_val < _pool.shape[0]:
+                                    _compact[_si, _ring_split:].copy_(_pool[_prev_bid_val, _ring_split:])
+                            else:
+                                # Single block: copy entire block
+                                if _cur_bid_val < _pool.shape[0]:
+                                    _compact[_si].copy_(_pool[_cur_bid_val])
+
                     # STATE gather: pool → compact kv_state/score_state
                     _comp = getattr(module, "compressor", None)
                     _ratio = getattr(module, "compress_ratio", 0)
@@ -604,9 +629,18 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                     num_tokens = input_ids.numel() if input_ids is not None else 1
                     positions = torch.zeros(num_tokens, dtype=torch.int32, device=model_device)
             else:
-                # Prefill: construct sequential positions [0, 1, 2, ...]
+                # Prefill: construct per-sequence positions [0,..,L1-1, 0,..,L2-1, ...]
+                # NOT cumulative [0,..,L1+L2-1] — SWA ring buffer needs per-seq positions.
                 num_tokens = input_ids.numel() if input_ids is not None else 1
-                positions = torch.arange(num_tokens, dtype=torch.int32, device=model_device)
+                _inp_lens = getattr(attn_inputs, "input_lengths", None) if attn_inputs else None
+                if _inp_lens is not None and _inp_lens.numel() > 1:
+                    _lens_cpu = _inp_lens.cpu().tolist()
+                    positions = torch.cat([
+                        torch.arange(int(l), dtype=torch.int32, device=model_device)
+                        for l in _lens_cpu
+                    ])
+                else:
+                    positions = torch.arange(num_tokens, dtype=torch.int32, device=model_device)
 
         # Build int64 positions for model forward (RoPE kernel requires int64).
         # bind() needs int32 (slot_mapping). Graph mode uses pre-allocated buffer.
