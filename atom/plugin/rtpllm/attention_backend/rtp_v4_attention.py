@@ -544,6 +544,65 @@ def _build_eager_decode_with_triton(attn_md, attn_inputs, v4_ratios, v4_block_ta
     return True
 
 
+def _build_prefill_extend_indices_gpu(positions, cu_seqlens_q, bid_per_tok, win, total_tokens, device):
+    """Build causal extend indices on GPU using vectorized torch ops."""
+    extend_counts = torch.minimum(positions + 1, torch.tensor(win, dtype=torch.int32, device=device))
+    indptr = torch.zeros(total_tokens + 1, dtype=torch.int32, device=device)
+    torch.cumsum(extend_counts, dim=0, out=indptr[1:])
+    total_nnz = int(indptr[-1].item())
+
+    if total_nnz == 0:
+        return torch.zeros(1, dtype=torch.int32, device=device), indptr
+
+    ext_starts = (cu_seqlens_q[bid_per_tok.long()] + positions - extend_counts + 1).to(torch.int32)
+    ext_starts_expanded = torch.repeat_interleave(ext_starts, extend_counts)
+    group_starts = torch.repeat_interleave(indptr[:-1], extend_counts)
+    global_idx = torch.arange(total_nnz, device=device, dtype=torch.int32)
+    indices = ext_starts_expanded + (global_idx - group_starts)
+    return indices, indptr
+
+
+def _build_hca_prefix_indices_gpu(positions, bid_per_tok, hca_bt, swa_pages, hca_k, total_tokens, device):
+    """Build HCA prefix indices on GPU."""
+    n_hca_per_tok = ((positions + 1) // 128).to(torch.int32)
+    indptr = torch.zeros(total_tokens + 1, dtype=torch.int32, device=device)
+    torch.cumsum(n_hca_per_tok, dim=0, out=indptr[1:])
+    total_nnz = int(indptr[-1].item())
+
+    if total_nnz == 0 or hca_bt is None or swa_pages <= 0:
+        empty = torch.zeros(0, dtype=torch.int32, device=device)
+        return empty, indptr
+
+    tok_ids = torch.repeat_interleave(torch.arange(total_tokens, device=device, dtype=torch.int64), n_hca_per_tok)
+    group_starts_exp = torch.repeat_interleave(indptr[:-1].long(), n_hca_per_tok)
+    ci = (torch.arange(total_nnz, device=device, dtype=torch.int64) - group_starts_exp).to(torch.int32)
+
+    bid = bid_per_tok[tok_ids].long()
+    lb = (ci // hca_k).long()
+    sb = ci % hca_k
+    max_blocks = hca_bt.shape[1]
+    lb_clamped = torch.clamp(lb, 0, max_blocks - 1)
+    pb = hca_bt[bid, lb_clamped].to(torch.int32)
+    indices = (swa_pages + pb * hca_k + sb).to(torch.int32)
+    return indices, indptr
+
+
+def _build_csa_prefix_indices_gpu(positions, bid_per_tok, n_csa_per_seq, index_topk, total_tokens, device):
+    """Build CSA prefix indices on GPU (zeros with computed indptr)."""
+    n_csa_per_tok = torch.minimum(
+        (positions + 1) // 4,
+        torch.minimum(
+            n_csa_per_seq[bid_per_tok.long()].to(torch.int32),
+            torch.tensor(index_topk, dtype=torch.int32, device=device),
+        ),
+    ).to(torch.int32)
+    indptr = torch.zeros(total_tokens + 1, dtype=torch.int32, device=device)
+    torch.cumsum(n_csa_per_tok, dim=0, out=indptr[1:])
+    total_nnz = int(indptr[-1].item())
+    indices = torch.zeros(max(total_nnz, 1), dtype=torch.int32, device=device)
+    return indices, indptr
+
+
 def _build_v4_per_forward_metadata(attn_md, attn_inputs, v4_ratios, v4_block_tables,
                                     region_to_group, device, window_size=128,
                                     pool_swa_pages=0):
@@ -610,17 +669,7 @@ def _build_v4_per_forward_metadata(attn_md, attn_inputs, v4_ratios, v4_block_tab
     else:
         attn_md.batch_id_per_token = torch.zeros(1, dtype=torch.int32, device=device)
 
-    # -- compress_plans --
-    try:
-        _build_compress_plans(attn_md, attn_inputs, v4_ratios, bs, device)
-    except Exception as e:
-        logger.warning("Failed to build compress_plans: %s — attention will use fallback", e)
-        attn_md.compress_plans = {}
-
-    # -- n_committed_csa_per_seq (how many CSA entries committed per seq) --
-    # For prefill: n_committed based on total context AFTER this fwd = prefix + new tokens.
-    #   RTP-LLM's sequence_lengths for prefill = prefix only (0 for first prefill).
-    # For decode: n_committed based on sequence_lengths (= total context including new token).
+    # -- prefix / seq_lens (computed once, reused by compress_plans and n_committed) --
     prefix = getattr(attn_inputs, "prefix_lengths", None)
     prefix_cpu = prefix.cpu().numpy().astype(np.int32) if prefix is not None else np.zeros(bs, dtype=np.int32)
     if is_prefill:
@@ -631,6 +680,15 @@ def _build_v4_per_forward_metadata(attn_md, attn_inputs, v4_ratios, v4_block_tab
             seq_lens_cpu = seq_lens.cpu().numpy().astype(np.int32)
         else:
             seq_lens_cpu = (prefix_cpu + input_lens_cpu).astype(np.int32)
+
+    # -- compress_plans (reuse pre-computed CPU arrays) --
+    try:
+        _build_compress_plans(attn_md, attn_inputs, v4_ratios, bs, device,
+                              input_lens_cpu=input_lens_cpu, prefix_cpu=prefix_cpu,
+                              seq_lens_cpu=seq_lens_cpu)
+    except Exception as e:
+        logger.warning("Failed to build compress_plans: %s — attention will use fallback", e)
+        attn_md.compress_plans = {}
 
     unique_ratios = set(r for r in v4_ratios if r > 0)
     csa_ratio = 4  # V4 CSA always uses ratio=4
@@ -669,8 +727,12 @@ def _build_v4_per_forward_metadata(attn_md, attn_inputs, v4_ratios, v4_block_tab
         else:
             positions_np = np.zeros(bs, dtype=np.int32)
     else:
-        # Prefill: sequential positions
-        positions_np = np.concatenate([np.arange(l, dtype=np.int32) for l in input_lens_cpu])
+        # Prefill: sequential positions (GPU, no Python loop)
+        cu_q_gpu = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        torch.cumsum(input_lengths.to(dtype=torch.int32, device=device), dim=0, out=cu_q_gpu[1:])
+        offsets = torch.repeat_interleave(cu_q_gpu[:-1], input_lengths.to(dtype=torch.int32, device=device))
+        positions_gpu = (torch.arange(total_tokens, device=device, dtype=torch.int32) - offsets)
+        positions_np = positions_gpu.cpu().numpy().astype(np.int32)
 
     cu_q_cpu = np.zeros(bs + 1, dtype=np.int32)
     np.cumsum(input_lens_cpu, out=cu_q_cpu[1:])
@@ -758,72 +820,35 @@ def _build_v4_per_forward_metadata(attn_md, attn_inputs, v4_ratios, v4_block_tab
 
     else:
         # === PREFILL_NATIVE: causal extend + empty prefix ===
-        # Extend: causal mask indices into per-fwd kv tensor (row indices)
-        ext_indices = []
-        ext_indptr = [0]
-        for t in range(total_tokens):
-            bid = int(bid_per_tok[t])
-            pos = int(positions_np[t])
-            extend_count = min(pos + 1, win)
-            cu_q = int(cu_q_cpu[bid])
-            ext_start = cu_q + pos - extend_count + 1
-            for k in range(extend_count):
-                ext_indices.append(ext_start + k)
-            ext_indptr.append(len(ext_indices))
+        # GPU-accelerated index construction (replaces Python for-loops)
+        positions_gpu_i32 = torch.from_numpy(positions_np).to(device=device, dtype=torch.int32)
+        bid_per_tok_gpu = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int32, device=device),
+            input_lengths.to(dtype=torch.int32, device=device),
+        )
+        cu_q_gpu = attn_md.cu_seqlens_q
 
-        attn_md.kv_indices_extend = torch.tensor(ext_indices, dtype=torch.int32, device=device)
-        attn_md.kv_indptr_extend = torch.tensor(ext_indptr, dtype=torch.int32, device=device)
+        # Extend indices (causal mask into per-fwd kv)
+        attn_md.kv_indices_extend, attn_md.kv_indptr_extend = \
+            _build_prefill_extend_indices_gpu(positions_gpu_i32, cu_q_gpu, bid_per_tok_gpu, win, total_tokens, device)
 
         empty_idx = torch.zeros(0, dtype=torch.int32, device=device)
         empty_ptr = torch.zeros(total_tokens + 1, dtype=torch.int32, device=device)
-        # SWA prefix: empty for PREFILL_NATIVE
         attn_md.kv_indices_prefix_swa = empty_idx
         attn_md.kv_indptr_prefix_swa = empty_ptr
 
-        # HCA prefix: committed HCA entries for each token
+        # HCA prefix indices
         swa_pages_pf = pool_swa_pages if pool_swa_pages > 0 else 0
         hca_bt = v4_block_tables.get(HCA_KV)
-        hca_bt_cpu = hca_bt.cpu().numpy() if hca_bt is not None else None
         hca_k_pf = win // 128
-        hca_pf_all = []
-        hca_pf_indptr = [0]
-        for t in range(total_tokens):
-            bid = int(bid_per_tok[t])
-            pos = int(positions_np[t])
-            n_hca = (pos + 1) // 128
-            if hca_bt_cpu is not None and n_hca > 0 and swa_pages_pf > 0:
-                for ci in range(n_hca):
-                    lb = ci // hca_k_pf
-                    sb = ci % hca_k_pf
-                    if lb < hca_bt_cpu.shape[1]:
-                        pb = int(hca_bt_cpu[bid, lb])
-                        if pb >= 0:
-                            hca_pf_all.append(swa_pages_pf + pb * hca_k_pf + sb)
-            hca_pf_indptr.append(len(hca_pf_all))
-        attn_md.kv_indices_prefix_hca = torch.tensor(
-            hca_pf_all, dtype=torch.int32, device=device
-        ) if hca_pf_all else empty_idx.clone()
-        attn_md.kv_indptr_prefix_hca = torch.tensor(
-            hca_pf_indptr, dtype=torch.int32, device=device)
+        attn_md.kv_indices_prefix_hca, attn_md.kv_indptr_prefix_hca = \
+            _build_hca_prefix_indices_gpu(positions_gpu_i32, bid_per_tok_gpu, hca_bt, swa_pages_pf, hca_k_pf, total_tokens, device)
 
-        # CSA prefix: space for Indexer topk entries
-        # (filled by csa_translate_pack during forward_impl)
-
+        # CSA prefix indices (zeros, filled by Indexer topk later)
         index_topk = 1024
-        n_csa_pf = (seq_lens_cpu // 4).astype(np.int32)
-        csa_pf_all = []
-        csa_pf_indptr = [0]
-        for t in range(total_tokens):
-            bid = int(bid_per_tok[t])
-            pos = int(positions_np[t])
-            n_csa = int(min((pos + 1) // 4, int(n_csa_pf[bid]), index_topk))
-            csa_pf_all.extend([0] * n_csa)
-            csa_pf_indptr.append(len(csa_pf_all))
-        attn_md.kv_indices_prefix_csa = torch.tensor(
-            csa_pf_all, dtype=torch.int32, device=device
-        ) if csa_pf_all else torch.zeros(0, dtype=torch.int32, device=device)
-        attn_md.kv_indptr_prefix_csa = torch.tensor(
-            csa_pf_indptr, dtype=torch.int32, device=device)
+        n_csa_per_seq_gpu = attn_md.n_committed_csa_per_seq
+        attn_md.kv_indices_prefix_csa, attn_md.kv_indptr_prefix_csa = \
+            _build_csa_prefix_indices_gpu(positions_gpu_i32, bid_per_tok_gpu, n_csa_per_seq_gpu, index_topk, total_tokens, device)
 
     attn_md.skip_prefix_len_csa = torch.zeros(total_tokens, dtype=torch.int32, device=device)
 
@@ -883,28 +908,33 @@ def _ratio_label(ratio):
     return "swa"
 
 
-def _build_compress_plans(attn_md, attn_inputs, v4_ratios, bs, device):
+def _build_compress_plans(attn_md, attn_inputs, v4_ratios, bs, device,
+                          input_lens_cpu=None, prefix_cpu=None, seq_lens_cpu=None):
     """Build CompressPlan dict for each unique compress ratio."""
     from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
     from atom.utils import CpuGpuBuffer
 
     is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-    input_lengths = attn_inputs.input_lengths
-    input_lens_cpu = input_lengths.cpu().numpy().astype(np.int32)
+    if input_lens_cpu is None:
+        input_lens_cpu = attn_inputs.input_lengths.cpu().numpy().astype(np.int32)
 
     if is_prefill:
         extend_lens_cpu = input_lens_cpu.copy()
-        prefix = getattr(attn_inputs, "prefix_lengths", None)
-        prefix_cpu = prefix.cpu().numpy().astype(np.int32) if prefix is not None else np.zeros(bs, dtype=np.int32)
-        context_lens_cpu = (prefix_cpu + input_lens_cpu).astype(np.int32)
+        if prefix_cpu is None:
+            prefix = getattr(attn_inputs, "prefix_lengths", None)
+            prefix_cpu = prefix.cpu().numpy().astype(np.int32) if prefix is not None else np.zeros(bs, dtype=np.int32)
+        context_lens_cpu = (prefix_cpu + input_lens_cpu).astype(np.int32) if seq_lens_cpu is None else seq_lens_cpu
     else:
         extend_lens_cpu = np.ones(bs, dtype=np.int32)
-        seq_lens_p1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
-        if seq_lens_p1 is not None:
-            context_lens_cpu = seq_lens_p1.cpu().numpy().astype(np.int32)
+        if seq_lens_cpu is not None:
+            context_lens_cpu = seq_lens_cpu
         else:
-            seq_lens = attn_inputs.sequence_lengths
-            context_lens_cpu = (seq_lens.cpu().numpy() + 1).astype(np.int32)
+            seq_lens_p1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
+            if seq_lens_p1 is not None:
+                context_lens_cpu = seq_lens_p1.cpu().numpy().astype(np.int32)
+            else:
+                seq_lens = attn_inputs.sequence_lengths
+                context_lens_cpu = (seq_lens.cpu().numpy() + 1).astype(np.int32)
 
     unique_ratios = sorted(set(r for r in v4_ratios if r > 0))
     unique_ratios_overlap = []
