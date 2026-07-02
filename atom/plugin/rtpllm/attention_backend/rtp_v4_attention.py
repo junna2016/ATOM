@@ -11,12 +11,16 @@ reads SWA entries from swa_kv and compress entries from compress_kv, avoiding
 any memory copy or new GPU allocation.
 """
 
+import gzip
 import logging
 import math
+import os
+import time
 from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch.profiler as torch_profiler
 import triton
 import triton.language as tl
 
@@ -1314,6 +1318,83 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# Plugin-side torch.profiler (bypasses rtp-llm C++ StepWindowProfiler)
+# Controlled by env vars:
+#   ATOM_PLUGIN_PROFILE=1          — arm profiling (won't start until trigger)
+#   ATOM_PLUGIN_PROFILE_DIR=<dir>  — output directory
+# Trigger files (created by profile_plugin.sh):
+#   touch $DIR/.start_profiling  → profiler starts on next forward with tokens
+#   touch $DIR/.stop_profiling   → profiler stops and exports trace
+# ---------------------------------------------------------------------------
+_plugin_profiler = None
+_plugin_profile_dir = None
+
+
+def _start_plugin_profiler():
+    global _plugin_profiler, _plugin_profile_dir
+    _plugin_profile_dir = os.environ.get(
+        "ATOM_PLUGIN_PROFILE_DIR", "./plugin_traces"
+    )
+    os.makedirs(_plugin_profile_dir, exist_ok=True)
+
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+
+    def _on_trace_ready(prof):
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        ms = int((time.time() % 1) * 1000)
+        gz_path = os.path.join(
+            _plugin_profile_dir,
+            f"plugin_rank{rank}_ts_{ts}_{ms:03d}.pt.trace.json.gz",
+        )
+        tmp_path = gz_path[:-3]  # .json without .gz
+        try:
+            t0 = time.monotonic()
+            prof.export_chrome_trace(tmp_path)
+            with open(tmp_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                while True:
+                    chunk = src.read(64 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            os.remove(tmp_path)
+            sz = os.path.getsize(gz_path)
+            logger.info(
+                "Plugin profiler rank %d: trace exported to %s (%.1f MB, %.1fs)",
+                rank, gz_path, sz / 1e6, time.monotonic() - t0,
+            )
+        except Exception:
+            logger.exception("Plugin profiler rank %d: failed to export trace", rank)
+            for p in (tmp_path, gz_path):
+                if os.path.exists(p):
+                    os.remove(p)
+
+    _plugin_profiler = torch_profiler.profile(
+        activities=[
+            torch_profiler.ProfilerActivity.CPU,
+            torch_profiler.ProfilerActivity.CUDA,
+        ],
+        on_trace_ready=_on_trace_ready,
+    )
+    _plugin_profiler.__enter__()
+    logger.info(
+        "Plugin profiler rank %d started (trigger-based, dir=%s)",
+        rank, _plugin_profile_dir,
+    )
+
+
+def _stop_plugin_profiler():
+    global _plugin_profiler
+    if _plugin_profiler is not None:
+        try:
+            _plugin_profiler.__exit__(None, None, None)
+        except Exception:
+            logger.exception("Plugin profiler stop failed")
+        _plugin_profiler = None
+        logger.info("Plugin profiler stopped and trace exported.")
+
+
 def _patched_v4_forward(self, x, positions):
     """Patched forward for DeepseekV4Attention in rtp-llm plugin mode.
 
@@ -1329,6 +1410,25 @@ def _patched_v4_forward(self, x, positions):
       - prepare_cuda_graph(): CPU computation + H2D to pre-allocated buffers
       - _run_v4_graph_index_kernels(): Triton kernels fill indices (captured)
     """
+    global _plugin_profiler, _plugin_profile_dir
+    if os.environ.get("ATOM_PLUGIN_PROFILE") == "1" and x.shape[0] > 0:
+        _profile_dir = _plugin_profile_dir or os.environ.get("ATOM_PLUGIN_PROFILE_DIR", "./plugin_traces")
+        _start_trigger = os.path.join(_profile_dir, ".start_profiling")
+        _stop_trigger = os.path.join(_profile_dir, ".stop_profiling")
+        if _plugin_profiler is None and os.path.exists(_start_trigger):
+            _start_plugin_profiler()
+            try:
+                os.remove(_start_trigger)
+            except OSError:
+                pass
+        elif _plugin_profiler is not None and os.path.exists(_stop_trigger):
+            _stop_plugin_profiler()
+            try:
+                os.remove(_stop_trigger)
+            except OSError:
+                pass
+            os.environ["ATOM_PLUGIN_PROFILE"] = "done"
+
     from atom.utils.forward_context import get_forward_context
 
     fc = get_forward_context()
