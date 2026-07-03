@@ -969,9 +969,9 @@ class Compressor(nn.Module):
                          Required for the Indexer FP8 path (slot resolution).
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -1064,8 +1064,6 @@ class Compressor(nn.Module):
         )
 
 
-
-
 class Indexer(nn.Module):
     """Selects top-k compressed KV positions for sparse attention via learned scoring.
 
@@ -1147,9 +1145,9 @@ class Indexer(nn.Module):
         # Register self in static_forward_context so the
         # `torch.ops.aiter.indexer_score_topk` dispatcher can look us up by
         # `layer_name` (= self.prefix). Same pattern as V4 MoE registration.
-        get_current_atom_config().compilation_config.static_forward_context[
-            prefix
-        ] = self
+        get_current_atom_config().compilation_config.static_forward_context[prefix] = (
+            self
+        )
 
     def forward_batched(
         self,
@@ -1459,12 +1457,12 @@ class DeepseekV4Attention(nn.Module):
         # TP shards heads + groups across ranks. ColumnParallelLinear (wq_b, wo_a)
         # auto-splits output dim, so per-rank counts must be divided by tp_size.
         tp_size = get_tensor_model_parallel_world_size()
-        assert (
-            args.n_heads % tp_size == 0
-        ), f"n_heads={args.n_heads} not divisible by tp={tp_size}"
-        assert (
-            args.o_groups % tp_size == 0
-        ), f"o_groups={args.o_groups} not divisible by tp={tp_size}"
+        assert args.n_heads % tp_size == 0, (
+            f"n_heads={args.n_heads} not divisible by tp={tp_size}"
+        )
+        assert args.o_groups % tp_size == 0, (
+            f"o_groups={args.o_groups} not divisible by tp={tp_size}"
+        )
         self.tp_size = tp_size
         self.n_local_heads = args.n_heads // tp_size
         self.q_lora_rank = args.q_lora_rank
@@ -1741,9 +1739,9 @@ class DeepseekV4Attention(nn.Module):
         per-seq slot + block_table from the V4 attention builder's metadata.
         Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
         """
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         # warmup_model runs BEFORE allocate_kv_cache → `unified_kv` is unbound
         # and the new sparse_attn_v4_paged_{decode,prefill} kernels would read
         # OOB. Same pattern as `attention_mha.py:98` — short-circuit dummy_run
@@ -1788,9 +1786,9 @@ class DeepseekV4Attention(nn.Module):
         # ----- Q/KV projections (main stream) -----
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        assert (
-            not _V4_FORCE_UE8M0_QUANT
-        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        assert not _V4_FORCE_UE8M0_QUANT, (
+            "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        )
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
         is_decode = attn_md.state is AttnState.DECODE
@@ -2239,14 +2237,14 @@ class MoE(nn.Module):
         Then renormalize so weights sum to 1 per token.
         """
         fwd_input_ids = get_forward_context().context.input_ids
-        assert (
-            fwd_input_ids is not None
-        ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        assert fwd_input_ids is not None, (
+            "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        )
         ids = fwd_input_ids.flatten()
         num_tokens = gating_output.shape[0]
-        assert (
-            ids.shape[0] == num_tokens
-        ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        assert ids.shape[0] == num_tokens, (
+            f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        )
         tid2eid = self.gate.tid2eid
 
         # Fused-shared expert: the custom_routing_function path bypasses
@@ -2294,7 +2292,8 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
@@ -2341,7 +2340,8 @@ class MoE(nn.Module):
         return routed
 
     def single_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
@@ -2349,7 +2349,8 @@ class MoE(nn.Module):
         return self.combine_outputs(routed, shared)
 
     def dual_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
@@ -2371,9 +2372,9 @@ class MoE(nn.Module):
         # Hash-layer routing reads `input_ids` from forward_context.context
         # inside `_hash_topk` (FusedMoE.custom_routing_function callback);
         # the MoE call itself doesn't need it as a parameter.
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         if self._use_dual_stream:
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
@@ -2655,14 +2656,15 @@ class ParallelHead(ParallelLMHead):
         self.hc_eps = hc_eps
 
     def get_logits(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
         """Project to vocab logits via the inherited `ParallelLMHead.forward`,
         which handles last-token slicing (prefill) + tgemm.mm + all-gather.
         """
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         return super().forward(x)
 
     def hc_head(
@@ -2837,7 +2839,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, atom_config: Config = None, config: Config = None, prefix: str = "") -> None:
+    def __init__(
+        self, atom_config: Config = None, config: Config = None, prefix: str = ""
+    ) -> None:
         super().__init__()
         config = atom_config if atom_config is not None else config
         self.atom_config = config

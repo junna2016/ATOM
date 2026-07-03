@@ -1017,4 +1017,3 @@ def sparse_attn_v4_paged_decode(
         softmax_scale,
         kv_scales=kv_scales,
     )
-

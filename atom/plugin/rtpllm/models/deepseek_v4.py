@@ -29,7 +29,6 @@ import torch
 from rtp_llm.models.deepseek_v4 import DeepSeekV4, DeepSeekV4Mtp
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.ops import ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
@@ -107,15 +106,20 @@ class _ATOMAttnPyObj:
         else:
             seq_lens_p1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
             if seq_lens_p1 is not None and seq_lens_p1.numel() >= bs:
-                positions_np = (seq_lens_p1[:bs].detach().cpu().numpy() - 1).astype(np.int32)
+                positions_np = (seq_lens_p1[:bs].detach().cpu().numpy() - 1).astype(
+                    np.int32
+                )
             else:
                 positions_np = np.zeros(bs, dtype=np.int32)
 
         # Block tables (for state_slot_mapping = SWA block_table[:, 0])
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-            SWA_KV, HCA_KV,
-            build_region_to_group_map, select_block_table_for_region,
+            SWA_KV,
+            HCA_KV,
+            build_region_to_group_map,
+            select_block_table_for_region,
         )
+
         region_to_group = build_region_to_group_map(rt.kv_cache)
         swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
         hca_bt = select_block_table_for_region(attn_inputs, HCA_KV, region_to_group)
@@ -152,14 +156,18 @@ class _ATOMAttnPyObj:
         csa_indptr_np = np.zeros(max_bs + 1, dtype=np.int32)
         hca_indptr_np = np.zeros(max_bs + 1, dtype=np.int32)
         if bs > 0:
-            swa_indptr_np[1:bs + 1] = np.cumsum(actual_swa, dtype=np.int32)
-            csa_indptr_np[1:bs + 1] = np.cumsum(actual_swa + csa_valid_k, dtype=np.int32)
-            hca_indptr_np[1:bs + 1] = np.cumsum(actual_swa + hca_valid, dtype=np.int32)
+            swa_indptr_np[1 : bs + 1] = np.cumsum(actual_swa, dtype=np.int32)
+            csa_indptr_np[1 : bs + 1] = np.cumsum(
+                actual_swa + csa_valid_k, dtype=np.int32
+            )
+            hca_indptr_np[1 : bs + 1] = np.cumsum(
+                actual_swa + hca_valid, dtype=np.int32
+            )
         # Pad tail with last value (sentinel: kv_len=0 for padded slots)
         if bs < max_bs:
-            swa_indptr_np[bs + 1:] = swa_indptr_np[bs]
-            csa_indptr_np[bs + 1:] = csa_indptr_np[bs]
-            hca_indptr_np[bs + 1:] = hca_indptr_np[bs]
+            swa_indptr_np[bs + 1 :] = swa_indptr_np[bs]
+            csa_indptr_np[bs + 1 :] = csa_indptr_np[bs]
+            hca_indptr_np[bs + 1 :] = hca_indptr_np[bs]
 
         # --- H2D copy to pre-allocated buffers ---
         bufs["positions"][:bs].copy_(
@@ -171,7 +179,9 @@ class _ATOMAttnPyObj:
         # Store actual block IDs for swa_kv gather/scatter in graph mode
         _block_ids_buf = bufs.get("_block_ids")
         if _block_ids_buf is None:
-            _block_ids_buf = torch.zeros(int(bufs["state_slot"].shape[0]), device=device, dtype=torch.int64)
+            _block_ids_buf = torch.zeros(
+                int(bufs["state_slot"].shape[0]), device=device, dtype=torch.int64
+            )
             bufs["_block_ids"] = _block_ids_buf
         _block_ids_buf[:bs].copy_(
             torch.from_numpy(block_ids_np).to(dtype=torch.int64), non_blocking=True
@@ -189,19 +199,30 @@ class _ATOMAttnPyObj:
             bufs["_prev_gather_block_ids"] = _curr_bid_tuple
             _bid_gpu = _block_ids_buf[:bs]
             # Full block table for multi-block gather (prompts > win tokens)
-            swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32) if swa_bt is not None else None
+            swa_bt_cpu = (
+                swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+                if swa_bt is not None
+                else None
+            )
             # Also get STATE block tables for compressor state gather
             _state_bts = {}
             try:
-                from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import CSA_STATE, HCA_STATE
+                from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
+                    CSA_STATE,
+                    HCA_STATE,
+                )
+
                 for _sr in (CSA_STATE, HCA_STATE):
-                    _sbt = select_block_table_for_region(attn_inputs, _sr, region_to_group)
+                    _sbt = select_block_table_for_region(
+                        attn_inputs, _sr, region_to_group
+                    )
                     if _sbt is not None:
                         _state_bts[_sr] = _sbt
             except Exception:
                 pass
             try:
                 from atom.models.deepseek_v4 import DeepseekV4Attention
+
                 kv_cache_data = getattr(rt, "_rtp_kv_cache_data", None)
                 for module in rt.model.modules():
                     if not isinstance(module, DeepseekV4Attention):
@@ -219,16 +240,26 @@ class _ATOMAttnPyObj:
                             _ring_split = _pos % win
                             _cur_col = _pos // win
                             _prev_col = _cur_col - 1 if _cur_col > 0 else 0
-                            _cur_bid_val = int(swa_bt_cpu[_si, min(_cur_col, swa_bt_cpu.shape[1]-1)])
+                            _cur_bid_val = int(
+                                swa_bt_cpu[_si, min(_cur_col, swa_bt_cpu.shape[1] - 1)]
+                            )
                             _cur_bid_val = max(_cur_bid_val, 0)
                             if _cur_col > 0 and _prev_col < swa_bt_cpu.shape[1]:
-                                _prev_bid_val = int(swa_bt_cpu[_si, min(_prev_col, swa_bt_cpu.shape[1]-1)])
+                                _prev_bid_val = int(
+                                    swa_bt_cpu[
+                                        _si, min(_prev_col, swa_bt_cpu.shape[1] - 1)
+                                    ]
+                                )
                                 _prev_bid_val = max(_prev_bid_val, 0)
                                 # Split gather: ring [0, split) from current, [split, win) from previous
                                 if _ring_split > 0 and _cur_bid_val < _pool.shape[0]:
-                                    _compact[_si, :_ring_split].copy_(_pool[_cur_bid_val, :_ring_split])
+                                    _compact[_si, :_ring_split].copy_(
+                                        _pool[_cur_bid_val, :_ring_split]
+                                    )
                                 if _prev_bid_val < _pool.shape[0]:
-                                    _compact[_si, _ring_split:].copy_(_pool[_prev_bid_val, _ring_split:])
+                                    _compact[_si, _ring_split:].copy_(
+                                        _pool[_prev_bid_val, _ring_split:]
+                                    )
                             else:
                                 # Single block: copy entire block
                                 if _cur_bid_val < _pool.shape[0]:
@@ -243,7 +274,11 @@ class _ATOMAttnPyObj:
                         _layer_id = getattr(module, "layer_id", -1)
                         _ce = kv_cache_data.get(f"layer_{_layer_id}")
                         _sp_name = "CSA_STATE" if _ratio == 4 else "HCA_STATE"
-                        _sp = _ce.k_cache.get(_sp_name) if _ce and isinstance(_ce.k_cache, dict) else None
+                        _sp = (
+                            _ce.k_cache.get(_sp_name)
+                            if _ce and isinstance(_ce.k_cache, dict)
+                            else None
+                        )
                         if _sbt is not None and _sp is not None:
                             _sp_raw = _sp.kv_cache_base.view(torch.float32)
                             _n_blk = _sp_raw.shape[0]
@@ -255,8 +290,12 @@ class _ATOMAttnPyObj:
                             _dim = _comp.kv_state.shape[2]
                             if _half == _ring * _dim:
                                 _gathered = _sp_view[_s_bids]
-                                _comp.kv_state[:bs] = _gathered[:, :_half].reshape(bs, _ring, _dim)
-                                _comp.score_state[:bs] = _gathered[:, _half:].reshape(bs, _ring, _dim)
+                                _comp.kv_state[:bs] = _gathered[:, :_half].reshape(
+                                    bs, _ring, _dim
+                                )
+                                _comp.score_state[:bs] = _gathered[:, _half:].reshape(
+                                    bs, _ring, _dim
+                                )
             except Exception as e:
                 logger.warning("SWA/STATE gather failed: %s", e)
 
@@ -269,13 +308,13 @@ class _ATOMAttnPyObj:
         bufs["n_hca"][:bs].copy_(
             torch.from_numpy(n_hca_np).to(dtype=torch.int32), non_blocking=True
         )
-        bufs["indptr_swa"][:max_bs + 1].copy_(
+        bufs["indptr_swa"][: max_bs + 1].copy_(
             torch.from_numpy(swa_indptr_np).to(dtype=torch.int32), non_blocking=True
         )
-        bufs["indptr_csa"][:max_bs + 1].copy_(
+        bufs["indptr_csa"][: max_bs + 1].copy_(
             torch.from_numpy(csa_indptr_np).to(dtype=torch.int32), non_blocking=True
         )
-        bufs["indptr_hca"][:max_bs + 1].copy_(
+        bufs["indptr_hca"][: max_bs + 1].copy_(
             torch.from_numpy(hca_indptr_np).to(dtype=torch.int32), non_blocking=True
         )
 
@@ -283,7 +322,9 @@ class _ATOMAttnPyObj:
         if hca_bt is not None and hca_bt.numel() >= bs:
             bt_gpu = bufs["block_tables_hca"]
             cols = min(int(hca_bt.shape[1]), int(bt_gpu.shape[1]))
-            bt_gpu[:bs, :cols].copy_(hca_bt[:bs, :cols].to(torch.int32), non_blocking=True)
+            bt_gpu[:bs, :cols].copy_(
+                hca_bt[:bs, :cols].to(torch.int32), non_blocking=True
+            )
 
         # --- Build compress_plans using CpuGpuBuffer plan buffers ---
         # make_compress_plans runs on CPU numpy + H2D via CpuGpuBuffer.copy_to_gpu().
@@ -293,6 +334,7 @@ class _ATOMAttnPyObj:
         decode_cap = bufs.get("_decode_compress_cap")
         if plan_buffers is not None:
             from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
+
             extend_lens_cpu = np.ones(bs, dtype=np.int32)
             context_lens_cpu = (positions_np + 1).astype(np.int32)
             compress_plans = make_compress_plans(
@@ -345,6 +387,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         self._model_dtype = first_param.dtype
 
         from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
+
         self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
         self._rtp_kv_cache_data = None
         self._rtp_kv_cache_signature = None
@@ -438,7 +481,9 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         }
         # Pre-allocated int64 positions buffer for model forward (RoPE kernel
         # requires int64) while bind() needs int32. Graph-safe via copy_().
-        self._cg_positions_i64 = torch.empty(max_num_tokens, device=device, dtype=torch.int64)
+        self._cg_positions_i64 = torch.empty(
+            max_num_tokens, device=device, dtype=torch.int64
+        )
 
         # --- V4-specific decode graph buffers ---
         # These persistent buffers hold V4 attention metadata (ragged indices,
@@ -484,12 +529,20 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             # write: at most bs * K tokens in write window
             "_plan_buffers": {
                 4: {
-                    "compress": CpuGpuBuffer(max(1, max_bs), 4, dtype=torch.int32, device=device),
-                    "write": CpuGpuBuffer(max(1, max_bs * 8), 4, dtype=torch.int32, device=device),
+                    "compress": CpuGpuBuffer(
+                        max(1, max_bs), 4, dtype=torch.int32, device=device
+                    ),
+                    "write": CpuGpuBuffer(
+                        max(1, max_bs * 8), 4, dtype=torch.int32, device=device
+                    ),
                 },
                 128: {
-                    "compress": CpuGpuBuffer(max(1, max_bs), 4, dtype=torch.int32, device=device),
-                    "write": CpuGpuBuffer(max(1, max_bs * 128), 4, dtype=torch.int32, device=device),
+                    "compress": CpuGpuBuffer(
+                        max(1, max_bs), 4, dtype=torch.int32, device=device
+                    ),
+                    "write": CpuGpuBuffer(
+                        max(1, max_bs * 128), 4, dtype=torch.int32, device=device
+                    ),
                 },
             },
             "_decode_compress_cap": {4: max(1, max_bs), 128: max(1, max_bs)},
@@ -506,6 +559,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # Initialize _compress_plans with valid empty plans so graph capture
         # doesn't KeyError even if prepare_cuda_graph returns early (warmup).
         from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
+
         empty_extend = np.zeros(1, dtype=np.int32)
         empty_context = np.zeros(1, dtype=np.int32)
         self._cg_v4_bufs["_compress_plans"] = make_compress_plans(
@@ -520,8 +574,12 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # Initialize module-level pool view caches for graph-capture fallback
         # (there is NO eager forward before graph capture in RTP-LLM).
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-            SWA_KV, CSA_KV, HCA_KV, get_pool_for_layer_region,
+            SWA_KV,
+            CSA_KV,
+            HCA_KV,
+            get_pool_for_layer_region,
         )
+
         try:
             swa_pool = get_pool_for_layer_region(kv_cache, 0, SWA_KV)
             compress_ratios = getattr(self, "_compress_ratios", None)
@@ -530,21 +588,42 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                 _args = getattr(model, "args", None) or getattr(
                     getattr(model, "model", None), "args", None
                 )
-                compress_ratios = list(getattr(_args, "compress_ratios", ())) if _args else []
-            csa_layer_id = next((i for i, r in enumerate(compress_ratios) if r == 4), None)
-            hca_layer_id = next((i for i, r in enumerate(compress_ratios) if r == 128), None)
-            csa_pool = get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV) if csa_layer_id is not None else None
-            hca_pool = get_pool_for_layer_region(kv_cache, hca_layer_id, HCA_KV) if hca_layer_id is not None else None
+                compress_ratios = (
+                    list(getattr(_args, "compress_ratios", ())) if _args else []
+                )
+            csa_layer_id = next(
+                (i for i, r in enumerate(compress_ratios) if r == 4), None
+            )
+            hca_layer_id = next(
+                (i for i, r in enumerate(compress_ratios) if r == 128), None
+            )
+            csa_pool = (
+                get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV)
+                if csa_layer_id is not None
+                else None
+            )
+            hca_pool = (
+                get_pool_for_layer_region(kv_cache, hca_layer_id, HCA_KV)
+                if hca_layer_id is not None
+                else None
+            )
             head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
 
             import atom.plugin.rtpllm.attention_backend.rtp_v4_attention as _v4_attn
+
             if swa_pool is not None:
                 _swa_raw = swa_pool.kv_cache_base
-                _v4_attn._SWA_FLAT_CACHE = _swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
+                _v4_attn._SWA_FLAT_CACHE = _swa_raw.view(torch.bfloat16).reshape(
+                    -1, head_dim
+                )
             if csa_pool is not None:
-                _v4_attn._CSA_COMPRESS_KV_CACHE = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
+                _v4_attn._CSA_COMPRESS_KV_CACHE = csa_pool.kv_cache_base.view(
+                    torch.bfloat16
+                ).reshape(-1, head_dim)
             if hca_pool is not None:
-                _v4_attn._HCA_COMPRESS_KV_CACHE = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(-1, head_dim)
+                _v4_attn._HCA_COMPRESS_KV_CACHE = hca_pool.kv_cache_base.view(
+                    torch.bfloat16
+                ).reshape(-1, head_dim)
             logger.info("Initialized pool view caches for graph capture fallback")
         except Exception as e:
             logger.warning("Failed to initialize pool view caches: %s", e)
@@ -558,12 +637,17 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         if self._rtp_kv_cache_data is None:
             try:
                 from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-                    build_v4_kv_cache_tensors, get_v4_compress_ratios,
+                    build_v4_kv_cache_tensors,
+                    get_v4_compress_ratios,
                 )
+
                 _ratios = get_v4_compress_ratios(self)
                 if _ratios:
                     self._rtp_kv_cache_data = build_v4_kv_cache_tensors(self, _ratios)
-                    logger.info("Pre-built kv_cache_data for graph capture (%d layers)", len(_ratios))
+                    logger.info(
+                        "Pre-built kv_cache_data for graph capture (%d layers)",
+                        len(_ratios),
+                    )
             except Exception as e:
                 logger.warning("Failed to pre-build kv_cache_data: %s", e)
 
@@ -593,7 +677,9 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             dummy_pos = torch.zeros(dummy_bs, dtype=torch.int64, device=device)
             with torch.no_grad():
                 self.model(input_ids=dummy_ids, positions=dummy_pos)
-            logger.info("ATOM V4 warmup eager forward done (pre-allocate MoE workspace)")
+            logger.info(
+                "ATOM V4 warmup eager forward done (pre-allocate MoE workspace)"
+            )
         except Exception as e:
             logger.warning("ATOM V4 warmup eager forward failed (non-fatal): %s", e)
 
@@ -617,36 +703,56 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
         if positions is not None:
-            positions = positions.to(device=model_device, dtype=torch.int32, non_blocking=True).contiguous()
+            positions = positions.to(
+                device=model_device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
         else:
-            is_prefill = bool(getattr(attn_inputs, "is_prefill", True)) if attn_inputs else True
+            is_prefill = (
+                bool(getattr(attn_inputs, "is_prefill", True)) if attn_inputs else True
+            )
             if not is_prefill and attn_inputs is not None:
                 # Decode: position = sequence_lengths (absolute position of new token)
                 seq_lens = getattr(attn_inputs, "sequence_lengths", None)
                 if seq_lens is not None and seq_lens.numel() > 0:
-                    positions = seq_lens.to(device=model_device, dtype=torch.int32, non_blocking=True).contiguous()
+                    positions = seq_lens.to(
+                        device=model_device, dtype=torch.int32, non_blocking=True
+                    ).contiguous()
                 else:
                     num_tokens = input_ids.numel() if input_ids is not None else 1
-                    positions = torch.zeros(num_tokens, dtype=torch.int32, device=model_device)
+                    positions = torch.zeros(
+                        num_tokens, dtype=torch.int32, device=model_device
+                    )
             else:
                 # Prefill: construct per-sequence positions [0,..,L1-1, 0,..,L2-1, ...]
                 # NOT cumulative [0,..,L1+L2-1] — SWA ring buffer needs per-seq positions.
                 num_tokens = input_ids.numel() if input_ids is not None else 1
-                _inp_lens = getattr(attn_inputs, "input_lengths", None) if attn_inputs else None
+                _inp_lens = (
+                    getattr(attn_inputs, "input_lengths", None) if attn_inputs else None
+                )
                 if _inp_lens is not None and _inp_lens.numel() > 1:
                     _lens_cpu = _inp_lens.cpu().tolist()
-                    positions = torch.cat([
-                        torch.arange(int(l), dtype=torch.int32, device=model_device)
-                        for l in _lens_cpu
-                    ])
+                    positions = torch.cat(
+                        [
+                            torch.arange(
+                                int(seq_len), dtype=torch.int32, device=model_device
+                            )
+                            for seq_len in _lens_cpu
+                        ]
+                    )
                 else:
-                    positions = torch.arange(num_tokens, dtype=torch.int32, device=model_device)
+                    positions = torch.arange(
+                        num_tokens, dtype=torch.int32, device=model_device
+                    )
 
         # Build int64 positions for model forward (RoPE kernel requires int64).
         # bind() needs int32 (slot_mapping). Graph mode uses pre-allocated buffer.
         if is_cuda_graph:
             v4_bufs = getattr(self, "_cg_v4_bufs", None)
-            n_tokens = input_ids.shape[0] if input_ids is not None and input_ids.numel() > 0 else 1
+            n_tokens = (
+                input_ids.shape[0]
+                if input_ids is not None and input_ids.numel() > 0
+                else 1
+            )
             if v4_bufs is not None and "positions" in v4_bufs:
                 pos_i64 = self._cg_positions_i64[:n_tokens]
                 pos_i64.copy_(v4_bufs["positions"][:n_tokens])
@@ -715,8 +821,10 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None:
             from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-                SWA_KV, get_pool_for_layer_region,
+                SWA_KV,
+                get_pool_for_layer_region,
             )
+
             swa_pool = get_pool_for_layer_region(kv_cache, 0, SWA_KV)
             if swa_pool is not None:
                 swa_num_blocks = int(swa_pool.kv_cache_base.shape[0])
@@ -885,5 +993,3 @@ class ATOMDeepSeekV4Mtp(DeepSeekV4Mtp):
 
     def _create_python_model(self):
         logger.warning("ATOMDeepSeekV4Mtp: MTP not yet implemented")
-
-

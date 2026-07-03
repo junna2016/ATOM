@@ -98,6 +98,7 @@ def get_pool_for_layer_region(
     """
     try:
         from rtp_llm.ops.compute_ops import KVCacheRegionName
+
         # Map int region id to pybind11 KVCacheRegionName enum
         _REGION_TO_ENUM = {
             1: KVCacheRegionName.CSA_KV,
@@ -113,7 +114,9 @@ def get_pool_for_layer_region(
             return kv_cache.get_layer_cache(layer_id, region_enum)
     except Exception as e:
         if layer_id == 0:
-            logger.debug("get_pool_for_layer_region(%d, %d) failed: %s", layer_id, region, e)
+            logger.debug(
+                "get_pool_for_layer_region(%d, %d) failed: %s", layer_id, region, e
+            )
     return None
 
 
@@ -140,15 +143,30 @@ def build_v4_kv_cache_tensors(
         raise ValueError("V4 plugin requires initialized kv_cache.")
 
     region_to_group = build_region_to_group_map(kv_cache)
-    logger.debug("V4 KV cache: type=%s, group_region_names=%s, region_to_group=%s, "
-                "attrs=%s",
-                type(kv_cache).__name__,
-                getattr(kv_cache, "group_region_names", "MISSING"),
-                region_to_group,
-                [a for a in dir(kv_cache) if not a.startswith('_') and ('cache' in a.lower() or 'group' in a.lower() or 'region' in a.lower() or 'layer' in a.lower())])
+    logger.debug(
+        "V4 KV cache: type=%s, group_region_names=%s, region_to_group=%s, attrs=%s",
+        type(kv_cache).__name__,
+        getattr(kv_cache, "group_region_names", "MISSING"),
+        region_to_group,
+        [
+            a
+            for a in dir(kv_cache)
+            if not a.startswith("_")
+            and (
+                "cache" in a.lower()
+                or "group" in a.lower()
+                or "region" in a.lower()
+                or "layer" in a.lower()
+            )
+        ],
+    )
     # Log pool structure once for debugging
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("V4 KV cache: %d groups, region_to_group=%s", len(region_to_group), region_to_group)
+        logger.debug(
+            "V4 KV cache: %d groups, region_to_group=%s",
+            len(region_to_group),
+            region_to_group,
+        )
 
     if not region_to_group:
         logger.warning(
@@ -200,8 +218,15 @@ def build_v4_block_tables(
         Only includes regions that have an associated group in region_to_group.
     """
     block_tables: Dict[int, Optional[torch.Tensor]] = {}
-    for region in (SWA_KV, CSA_KV, HCA_KV, INDEXER_KV,
-                   CSA_STATE, HCA_STATE, INDEXER_STATE):
+    for region in (
+        SWA_KV,
+        CSA_KV,
+        HCA_KV,
+        INDEXER_KV,
+        CSA_STATE,
+        HCA_STATE,
+        INDEXER_STATE,
+    ):
         bt = select_block_table_for_region(attn_inputs, region, region_to_group)
         if bt is not None:
             block_tables[region] = bt
@@ -276,7 +301,10 @@ def is_v4_model(runtime: Any) -> bool:
         args = getattr(getattr(model, "model", None), "args", None)
     if args is None:
         return False
-    return hasattr(args, "compress_ratios") and len(getattr(args, "compress_ratios", ())) > 0
+    return (
+        hasattr(args, "compress_ratios")
+        and len(getattr(args, "compress_ratios", ())) > 0
+    )
 
 
 def get_v4_compress_ratios(runtime: Any) -> list[int]:

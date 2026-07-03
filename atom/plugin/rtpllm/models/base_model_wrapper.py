@@ -43,6 +43,7 @@ def _register_atom_deepseek_v4() -> None:
     _model_factory["deepseek_v4"] = ATOMDeepSeekV4
     _hf_architecture_2_ft["DeepseekV4ForCausalLM"] = "deepseek_v4"
 
+
 _register_atom_qwen35_moe()
 _register_atom_glm5_moe()
 _register_atom_deepseek_v4()

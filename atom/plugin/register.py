@@ -2,6 +2,7 @@ import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+
 try:
     from atom.models.glm4_moe import Glm4MoeForCausalLM
 except (ImportError, ModuleNotFoundError):
@@ -56,8 +57,6 @@ if is_sglang():
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
         }
     )
-
-
 
 
 def _register_custom_attention_to_sglang() -> None:
@@ -151,9 +150,9 @@ def init_aiter_dist(config: Config) -> None:
         rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
     tensor_parallel_size = config.tensor_parallel_size
 
-    assert (
-        config.plugin_config.is_plugin_mode
-    ), "Make sure ATOM is running in plugin mode"
+    assert config.plugin_config.is_plugin_mode, (
+        "Make sure ATOM is running in plugin mode"
+    )
 
     use_vllm_atom_owned_ep = (
         config.plugin_config.is_vllm
