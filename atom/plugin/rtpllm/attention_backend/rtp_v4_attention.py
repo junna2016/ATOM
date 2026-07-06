@@ -13,6 +13,7 @@ any memory copy or new GPU allocation.
 
 import logging
 import math
+import os
 from typing import Any, Dict
 
 import numpy as np
@@ -33,6 +34,9 @@ from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
 logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.rtp_v4_attention")
 
 LOG2E = math.log2(math.e)
+_ATOM_INDEXER_FP8_ENTRY_BYTES = 144
+_RTP_INDEXER_BF16_ENTRY_BYTES = 256
+_RTP_INDEXER_FP8_ENTRY_BYTES = 132
 
 # ---------------------------------------------------------------------------
 # Dual-ptr paged decode kernel (plugin-only, does NOT modify ATOM native code)
@@ -1276,15 +1280,120 @@ def _bind_v4_compressor_views(
     # Skip state bind entirely; shadow buffers handle state persistence.
 
 
+def _try_bind_v4_indexer_rtp_pool_144(
+    attn_module: Any,
+    indexer: Any,
+    kv_pool: Any,
+    fp8_dtype: torch.dtype,
+    idx_head_dim: int,
+    aligned_dim: int,
+) -> bool:
+    """Bind ROCm ATOM 144B INDEXER_KV pool directly when available."""
+    if torch.version.hip is None:
+        return False
+    if os.environ.get("ROCM_ATOM_DSV4_INDEXER_FP8_KV_CACHE", "0") not in (
+        "1",
+        "true",
+        "True",
+        "ON",
+        "on",
+    ):
+        return False
+
+    base = getattr(kv_pool, "kv_cache_base", None)
+    if base is None or base.dim() != 2 or base.numel() == 0:
+        return False
+
+    stride_bytes = int(base.shape[1]) * int(base.element_size())
+    if stride_bytes % _ATOM_INDEXER_FP8_ENTRY_BYTES != 0:
+        return False
+    entries_per_block = stride_bytes // _ATOM_INDEXER_FP8_ENTRY_BYTES
+    if entries_per_block <= 0 or aligned_dim != _ATOM_INDEXER_FP8_ENTRY_BYTES:
+        return False
+
+    raw_u8 = base.view(torch.uint8)
+    if int(raw_u8.shape[1]) < stride_bytes:
+        return False
+
+    num_blocks = int(raw_u8.shape[0])
+    kv_u8 = raw_u8.as_strided(
+        size=(num_blocks, entries_per_block, aligned_dim),
+        stride=(stride_bytes, aligned_dim, 1),
+    )
+    kv_cache = kv_u8.view(fp8_dtype)
+    indexer.kv_cache = kv_cache
+    indexer._rtp_idx_kv_pool_144 = kv_cache
+
+    idx_compressor = getattr(indexer, "compressor", None)
+    if idx_compressor is not None:
+        idx_compressor.kv_cache = kv_cache
+        block_fp32_stride = stride_bytes // 4
+        scale_fp32_offset = (entries_per_block * idx_head_dim) // 4
+        idx_compressor.cache_scale = (
+            kv_cache.view(torch.float32)
+            .view(-1)
+            .as_strided(
+                size=(num_blocks, entries_per_block),
+                stride=(block_fp32_stride, 1),
+                storage_offset=scale_fp32_offset,
+            )
+        )
+
+    if not getattr(indexer, "_rtp_idx_kv_pool_144_logged", False):
+        logger.info(
+            "V4 INDEXER_KV binding=rtp_pool_144 layer=%s blocks=%d entries_per_block=%d stride_bytes=%d",
+            getattr(attn_module, "layer_id", "?"),
+            num_blocks,
+            entries_per_block,
+            stride_bytes,
+        )
+        indexer._rtp_idx_kv_pool_144_logged = True
+    return True
+
+
+def _infer_v4_indexer_entries_per_block(
+    kv_pool: Any,
+    aligned_dim: int,
+    fallback_entries: int,
+) -> int:
+    base = getattr(kv_pool, "kv_cache_base", None)
+    if base is None or base.dim() != 2 or base.numel() == 0:
+        return fallback_entries
+
+    stride_bytes = int(base.shape[1]) * int(base.element_size())
+    for entry_bytes in (
+        _ATOM_INDEXER_FP8_ENTRY_BYTES,
+        _RTP_INDEXER_FP8_ENTRY_BYTES,
+        _RTP_INDEXER_BF16_ENTRY_BYTES,
+    ):
+        if stride_bytes % entry_bytes == 0:
+            entries_per_block = stride_bytes // entry_bytes
+            if entries_per_block > 0:
+                return entries_per_block
+
+    if stride_bytes % aligned_dim == 0:
+        entries_per_block = stride_bytes // aligned_dim
+        if entries_per_block > 0:
+            return entries_per_block
+
+    logger.warning(
+        "V4 INDEXER_KV could not infer entries_per_block from stride_bytes=%d; using fallback=%d",
+        stride_bytes,
+        fallback_entries,
+    )
+    return fallback_entries
+
+
 def _bind_v4_indexer_views(
     attn_module: Any,
     layer_pools: Dict[str, Any],
 ) -> None:
-    """Bind indexer kv_cache as FP8 shadow buffer.
+    """Bind indexer kv_cache from RTP 144B pool or FP8 shadow buffer.
 
     Indexer scoring kernel (top_k_per_row_decode → fp8_paged_mqa_logits)
     requires FP8 kv_cache regardless of RTP-LLM's kv_cache_dtype setting.
-    We allocate a per-layer FP8 contiguous shadow buffer.
+    ROCm ATOM plugin can request a dedicated 144B INDEXER_KV pool and bind it
+    zero-copy; otherwise we allocate a per-layer FP8 contiguous shadow buffer.
 
     Main Compressor (CSA/HCA) stays BF16 — only the Indexer's inner
     Compressor uses FP8 (is_quant=True in fused_compress_attn).
@@ -1305,13 +1414,27 @@ def _bind_v4_indexer_views(
     idx_head_dim = getattr(indexer, "head_dim", 128)
     ratio = attn_module.compress_ratio
     window_size = attn_module.window_size
-    k1 = window_size // ratio  # 32
     aligned_dim = ((idx_head_dim + 4 + 15) // 16) * 16  # 144
 
     kv_pool = layer_pools.get("INDEXER_KV")
     if kv_pool is None:
         return
 
+    if _try_bind_v4_indexer_rtp_pool_144(
+        attn_module,
+        indexer,
+        kv_pool,
+        fp8_dtype,
+        idx_head_dim,
+        aligned_dim,
+    ):
+        return
+
+    k1 = _infer_v4_indexer_entries_per_block(
+        kv_pool,
+        aligned_dim,
+        window_size // ratio,
+    )
     NB = kv_pool.kv_cache_base.shape[0]
 
     # Use max of INDEXER_KV and CSA_KV block counts
@@ -1326,6 +1449,14 @@ def _bind_v4_indexer_views(
             NB, k1, aligned_dim, dtype=fp8_dtype, device=kv_pool.kv_cache_base.device
         )
         indexer._rtp_idx_kv_shadow = shadow_kv
+        if not getattr(indexer, "_rtp_idx_kv_shadow_logged", False):
+            logger.info(
+                "V4 INDEXER_KV binding=shadow_fallback layer=%s blocks=%d entries_per_block=%d",
+                getattr(attn_module, "layer_id", "?"),
+                NB,
+                k1,
+            )
+            indexer._rtp_idx_kv_shadow_logged = True
 
     # Bind kv_cache for both Indexer and its inner Compressor
     indexer.kv_cache = shadow_kv
