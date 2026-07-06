@@ -20,12 +20,15 @@ Reference: Qwen3.5 plugin (atom/plugin/rtpllm/models/qwen3_5.py)
            SGLang V4 bridge (atom/plugin/sglang/deepseek_v4_bridge.py)
 """
 
+import gzip
 import logging
 import os
+import time
 from typing import Any
 
 import numpy as np
 import torch
+import torch.profiler as torch_profiler
 from rtp_llm.models.deepseek_v4 import DeepSeekV4, DeepSeekV4Mtp
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
@@ -35,6 +38,87 @@ from rtp_llm.utils.model_weight import W
 from atom.model_loader.loader import WeightsMapper
 
 logger = logging.getLogger("atom.plugin.rtpllm.models.deepseek_v4")
+
+# ---------------------------------------------------------------------------
+# Plugin-side torch.profiler (bypasses rtp-llm C++ StepWindowProfiler)
+# Controlled by env vars:
+#   ATOM_PLUGIN_PROFILE=1          — arm profiling (won't start until trigger)
+#   ATOM_PLUGIN_PROFILE_DIR=<dir>  — output directory
+# Trigger files (created by profile_plugin.sh):
+#   touch $DIR/.start_profiling  → profiler starts on next forward with tokens
+#   touch $DIR/.stop_profiling   → profiler stops and exports trace
+# ---------------------------------------------------------------------------
+_plugin_profiler = None
+_plugin_profile_dir = None
+
+
+def _start_plugin_profiler():
+    global _plugin_profiler, _plugin_profile_dir
+    _plugin_profile_dir = os.environ.get("ATOM_PLUGIN_PROFILE_DIR", "./plugin_traces")
+    os.makedirs(_plugin_profile_dir, exist_ok=True)
+
+    try:
+        rank = torch.cuda.current_device()
+    except Exception:
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+
+    def _on_trace_ready(prof):
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        ms = int((time.time() % 1) * 1000)
+        gz_path = os.path.join(
+            _plugin_profile_dir,
+            f"plugin_rank{rank}_ts_{ts}_{ms:03d}.pt.trace.json.gz",
+        )
+        tmp_path = gz_path[:-3]  # .json without .gz
+        try:
+            t0 = time.monotonic()
+            prof.export_chrome_trace(tmp_path)
+            with open(tmp_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                while True:
+                    chunk = src.read(64 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            os.remove(tmp_path)
+            sz = os.path.getsize(gz_path)
+            logger.info(
+                "Plugin profiler rank %d: trace exported to %s (%.1f MB, %.1fs)",
+                rank,
+                gz_path,
+                sz / 1e6,
+                time.monotonic() - t0,
+            )
+        except Exception:
+            logger.exception("Plugin profiler rank %d: failed to export trace", rank)
+            for p in (tmp_path, gz_path):
+                if os.path.exists(p):
+                    os.remove(p)
+
+    _plugin_profiler = torch_profiler.profile(
+        activities=[
+            torch_profiler.ProfilerActivity.CPU,
+            torch_profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        on_trace_ready=_on_trace_ready,
+    )
+    _plugin_profiler.__enter__()
+    logger.info(
+        "Plugin profiler rank %d started (trigger-based, dir=%s)",
+        rank,
+        _plugin_profile_dir,
+    )
+
+
+def _stop_plugin_profiler():
+    global _plugin_profiler
+    if _plugin_profiler is not None:
+        try:
+            _plugin_profiler.__exit__(None, None, None)
+        except Exception:
+            logger.exception("Plugin profiler stop failed")
+        _plugin_profiler = None
+        logger.info("Plugin profiler stopped and trace exported.")
 
 
 class _NoopWeightManager:
@@ -684,6 +768,29 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             logger.warning("ATOM V4 warmup eager forward failed (non-fatal): %s", e)
 
     def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        # Profiler trigger check (model-level, called once per forward)
+        global _plugin_profiler, _plugin_profile_dir
+        input_ids = getattr(inputs, "input_ids", None)
+        if os.environ.get("ATOM_PLUGIN_PROFILE") == "1" and input_ids is not None and input_ids.numel() > 0:
+            _profile_dir = _plugin_profile_dir or os.environ.get(
+                "ATOM_PLUGIN_PROFILE_DIR", "./plugin_traces"
+            )
+            _start_trigger = os.path.join(_profile_dir, ".start_profiling")
+            _stop_trigger = os.path.join(_profile_dir, ".stop_profiling")
+            if _plugin_profiler is None and os.path.exists(_start_trigger):
+                _start_plugin_profiler()
+                try:
+                    os.remove(_start_trigger)
+                except OSError:
+                    pass
+            elif _plugin_profiler is not None and os.path.exists(_stop_trigger):
+                _stop_plugin_profiler()
+                try:
+                    os.remove(_stop_trigger)
+                except OSError:
+                    pass
+                os.environ["ATOM_PLUGIN_PROFILE"] = "done"
+
         try:
             return self._forward_impl(inputs, fmha_impl)
         except Exception as e:
