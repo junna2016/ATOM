@@ -289,17 +289,30 @@ class _ATOMAttnPyObj:
         # data and producing a garbage burst at the window boundary. This is the
         # CUDA-graph-only precision bug (eager decode has no such re-seed).
         #
-        # Detect the first decode step of a request by position discontinuity:
-        # within a request positions increase by exactly 1 per step, so
-        # cur != prev+1 (or no prev / batch size change) marks a new/restarted
-        # request. bufs is per-process (per TP rank), so this state is per-rank.
+        # PER-SLOT seed decision. A slot is (re)seeded only if it is genuinely a
+        # new/restarted request: no prior entry (first step, or the batch grew
+        # into this slot), or its position is discontinuous vs the previous step
+        # (within a request positions increase by exactly 1 per step).
+        #
+        # This MUST be per-slot, not all-or-nothing: CUDA-graph decode pads the
+        # batch to a fixed captured size with inactive slots whose sentinel
+        # position is constant (e.g. 4094). A constant position is "discontinuous"
+        # every step, so an all-or-nothing guard re-seeds EVERY step whenever any
+        # padding slot is present, clobbering the self-maintained rings of the
+        # real active requests (the BS>1 garbage bug). Seeding a padding slot is
+        # harmless (its output is discarded); never re-seeding a continuing real
+        # slot preserves its ring. bufs is per-process (per TP rank).
         _prev_pos = bufs.get("_prev_seed_positions")
         _cur_pos = positions_np[:bs].tolist()
-        if _prev_pos is None or len(_prev_pos) != len(_cur_pos):
-            _regather_ran = True
+        if _prev_pos is None:
+            _seed_mask = [True] * bs
         else:
-            _regather_ran = any(c != p + 1 for c, p in zip(_cur_pos, _prev_pos))
+            _seed_mask = [
+                (i >= len(_prev_pos)) or (c != _prev_pos[i] + 1)
+                for i, c in enumerate(_cur_pos)
+            ]
         bufs["_prev_seed_positions"] = _cur_pos
+        _regather_ran = any(_seed_mask)
         if _regather_ran:
             bufs["_prev_gather_block_ids"] = _curr_bid_tuple
             _bid_gpu = _block_ids_buf[:bs]
@@ -341,6 +354,8 @@ class _ATOMAttnPyObj:
                     _pool = getattr(module, "_rtp_pool_swa_kv", None)
                     if _compact is not None and _pool is not None:
                         for _si in range(bs):
+                            if not _seed_mask[_si]:
+                                continue
                             _pos = int(positions_np[_si])
                             _ring_split = _pos % win
                             _cur_col = _pos // win
@@ -395,12 +410,16 @@ class _ATOMAttnPyObj:
                             _dim = _comp.kv_state.shape[2]
                             if _half == _ring * _dim:
                                 _gathered = _sp_view[_s_bids]
-                                _comp.kv_state[:bs] = _gathered[:, :_half].reshape(
-                                    bs, _ring, _dim
-                                )
-                                _comp.score_state[:bs] = _gathered[:, _half:].reshape(
-                                    bs, _ring, _dim
-                                )
+                                _kv_all = _gathered[:, :_half].reshape(bs, _ring, _dim)
+                                _sc_all = _gathered[:, _half:].reshape(bs, _ring, _dim)
+                                # Per-slot: only overwrite state for slots being
+                                # (re)seeded; continuing real requests keep their
+                                # self-maintained state.
+                                for _si in range(bs):
+                                    if not _seed_mask[_si]:
+                                        continue
+                                    _comp.kv_state[_si] = _kv_all[_si]
+                                    _comp.score_state[_si] = _sc_all[_si]
             except Exception as e:
                 logger.warning("SWA/STATE gather failed: %s", e)
 
