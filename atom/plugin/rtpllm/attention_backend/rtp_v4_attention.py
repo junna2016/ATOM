@@ -501,12 +501,15 @@ def _build_eager_decode_with_triton(
 
     # --- Compact state_slot_mapping = [0..bs-1] ---
     ssm_np = np.arange(bs, dtype=np.int32)
-    # Save original block IDs for gather/scatter
+    # Save original block IDs for gather/scatter. block_ids_raw_np keeps the
+    # signed value: a freed SWA slot is -1, which we detect below to skip
+    # pool<->ring sync for rows past their first window boundary.
     if swa_bt is not None and swa_bt.numel() >= bs:
-        block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
-        block_ids_np = np.maximum(block_ids_np, 0)  # guard -1
+        block_ids_raw_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
+        block_ids_np = np.maximum(block_ids_raw_np, 0)  # guard -1
     else:
-        block_ids_np = np.arange(bs, dtype=np.int32)
+        block_ids_raw_np = np.arange(bs, dtype=np.int32)
+        block_ids_np = block_ids_raw_np
 
     # --- n_committed ---
     n_csa_np = ((positions_np + 1) // 4).astype(np.int32)
@@ -651,6 +654,17 @@ def _build_eager_decode_with_triton(
         block_ids_np.astype(np.int64)
     ).to(device=device)
     attn_md._eager_triton_active_bs = bs
+
+    # Rows whose SWA col0 is a VALID (non-freed) block. block_ids_raw_np < 0
+    # marks a freed slot (the sequence has crossed its first sliding-window
+    # boundary, pos>=2*win): the pool holds no live SWA data there and the pool
+    # code clamps -1 to physical block 0. Syncing those rows would gather stale
+    # block-0 KV into the compact ring (one-step corruption → a glitch token)
+    # and scatter the ring onto block 0, polluting whatever request owns it in a
+    # batch. We skip pool<->ring sync for freed rows and let the ring
+    # self-maintain via swa_write — the last valid gather already seeded it.
+    _valid_rows_np = np.nonzero(block_ids_raw_np >= 0)[0].astype(np.int64)
+    attn_md._eager_swa_gather_rows = torch.from_numpy(_valid_rows_np).to(device=device)
     attn_md._eager_triton_swa_pages = swa_pages_val
     attn_md._eager_triton_positions = positions_gpu
 
@@ -1993,11 +2007,14 @@ def _patched_v4_forward(self, x, positions):
                         cache_entry is not None,
                     )
 
-        # Gather: pool[block_ids] → compact swa_kv[0..bs-1]
+        # Gather: pool[block_ids] → compact swa_kv, ONLY for valid-col0 rows.
+        # Rows whose SWA col0 is a freed slot keep their self-maintained ring.
         _pool_swa = getattr(self, "_rtp_pool_swa_kv", None)
-        if _pool_swa is not None and active_bs > 0:
-            _bid = _triton_block_ids[:active_bs]
-            self.swa_kv[:active_bs].copy_(_pool_swa.index_select(0, _bid))
+        _swa_rows = getattr(attn_md, "_eager_swa_gather_rows", None)
+        if _pool_swa is not None and _swa_rows is not None and _swa_rows.numel() > 0:
+            _bid_valid = _triton_block_ids.index_select(0, _swa_rows)
+            _gathered = _pool_swa.index_select(0, _bid_valid)
+            self.swa_kv.index_copy_(0, _swa_rows, _gathered)
 
         try:
             result = self.forward_impl(x, positions)
@@ -2011,11 +2028,13 @@ def _patched_v4_forward(self, x, positions):
             )
             return torch.zeros_like(x)
 
-        # --- Scatter: compact → pool ---
-        # SWA scatter
-        if _pool_swa is not None and active_bs > 0:
-            _bid = _triton_block_ids[:active_bs]
-            _pool_swa.index_copy_(0, _bid, self.swa_kv[:active_bs])
+        # --- Scatter: compact → pool, ONLY for valid-col0 rows ---
+        # Skipping freed-col0 rows also avoids polluting physical block 0 (the
+        # -1 clamp target), which may belong to another live request in a batch.
+        if _pool_swa is not None and _swa_rows is not None and _swa_rows.numel() > 0:
+            _bid_valid = _triton_block_ids.index_select(0, _swa_rows)
+            _src = self.swa_kv.index_select(0, _swa_rows)
+            _pool_swa.index_copy_(0, _bid_valid, _src)
         # STATE scatter
         if (
             _state_pool_view is not None
