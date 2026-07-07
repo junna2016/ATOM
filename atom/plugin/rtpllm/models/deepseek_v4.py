@@ -279,7 +279,28 @@ class _ATOMAttnPyObj:
         # SWA writes from previous steps, so we only gather when block_ids change.
         _prev_bids = bufs.get("_prev_gather_block_ids", None)
         _curr_bid_tuple = tuple(block_ids_np[:bs].tolist())
-        if _prev_bids is None or _prev_bids != _curr_bid_tuple:
+        # Seed the compact SWA ring / compressor state only at the FIRST decode
+        # step of each request. The compact ring is self-maintaining across decode
+        # steps via swa_write, so a mid-request re-seed is unnecessary — and
+        # harmful: the old guard re-seeded whenever the SWA block_table col0
+        # changed (i.e. at a window crossing, e.g. step 128), reading pool blocks
+        # [pos//win-1, pos//win] that decode never updated (per-step scatter
+        # targets col0), thereby overwriting the correct ring with stale prefill
+        # data and producing a garbage burst at the window boundary. This is the
+        # CUDA-graph-only precision bug (eager decode has no such re-seed).
+        #
+        # Detect the first decode step of a request by position discontinuity:
+        # within a request positions increase by exactly 1 per step, so
+        # cur != prev+1 (or no prev / batch size change) marks a new/restarted
+        # request. bufs is per-process (per TP rank), so this state is per-rank.
+        _prev_pos = bufs.get("_prev_seed_positions")
+        _cur_pos = positions_np[:bs].tolist()
+        if _prev_pos is None or len(_prev_pos) != len(_cur_pos):
+            _regather_ran = True
+        else:
+            _regather_ran = any(c != p + 1 for c, p in zip(_cur_pos, _prev_pos))
+        bufs["_prev_seed_positions"] = _cur_pos
+        if _regather_ran:
             bufs["_prev_gather_block_ids"] = _curr_bid_tuple
             _bid_gpu = _block_ids_buf[:bs]
             # Full block table for multi-block gather (prompts > win tokens)
