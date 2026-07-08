@@ -234,7 +234,132 @@ def build_v4_kv_cache_tensors(
             v_scale=None,
         )
 
+    _selfcheck_v4_pools(cache_data, compress_ratios)
     return cache_data
+
+
+_SELFCHECK_DONE = False
+
+
+def _pool_geometry(pool: Any):
+    """(blocks, stride_bytes, dtype) from a LayerKVCache handle.
+
+    Host-side metadata only — reads .shape/.element_size()/.dtype, never touches
+    device memory, so it is free of both perf cost and GPU-fault risk.
+    """
+    base = getattr(pool, "kv_cache_base", None)
+    if base is None or base.dim() < 1:
+        return None
+    blocks = int(base.shape[0])
+    if base.dim() >= 2:
+        stride_bytes = int(base.shape[1]) * int(base.element_size())
+    else:
+        stride_bytes = int(base.element_size())
+    return blocks, stride_bytes, str(base.dtype)
+
+
+def _selfcheck_v4_pools(
+    cache_data: Dict[str, KVCacheTensor], compress_ratios: list
+) -> None:
+    """One-time (per process) health summary of the 7 V4 KV pools, logged at
+    startup BEFORE any request. Aggregates each region across layers and flags
+    any layer missing a region it should own, so a rebase that changes the pool
+    layout surfaces here immediately instead of as wrong output later.
+
+    Logging only; runs once; host-side metadata only (no inference-path cost).
+    """
+    global _SELFCHECK_DONE
+    if _SELFCHECK_DONE:
+        return
+    _SELFCHECK_DONE = True
+    try:
+        n_csa = sum(1 for r in compress_ratios if r == 4)
+        n_hca = sum(1 for r in compress_ratios if r == 128)
+        n_dense = sum(1 for r in compress_ratios if r not in (4, 128))
+
+        # region_name -> {expect, have, geom, missing_layers}
+        agg: Dict[str, Dict[str, Any]] = {}
+        # Layers that own NONE of their expected regions are non-KV layers (an
+        # MTP/draft or extra trailing entry that RTP allocates no pool for —
+        # compress_ratios can be longer than num_hidden_layers). Report these
+        # separately instead of flagging every region as MISSING (false alarm).
+        no_pool_layers = []
+        for layer_id, ratio in enumerate(compress_ratios):
+            if ratio == 4:
+                expected = _CSA_REGIONS
+            elif ratio == 128:
+                expected = _HCA_REGIONS
+            else:
+                expected = _DENSE_REGIONS
+            entry = cache_data.get(f"layer_{layer_id}")
+            k_cache = getattr(entry, "k_cache", None) or {}
+            if expected and not any(
+                k_cache.get(_REGION_NAMES.get(r, f"REGION_{r}")) is not None
+                for r in expected
+            ):
+                no_pool_layers.append(layer_id)
+                continue
+            for region in expected:
+                name = _REGION_NAMES.get(region, f"REGION_{region}")
+                a = agg.setdefault(
+                    name, {"expect": 0, "have": 0, "geom": None, "missing": []}
+                )
+                a["expect"] += 1
+                pool = k_cache.get(name)
+                if pool is not None:
+                    a["have"] += 1
+                    if a["geom"] is None:
+                        a["geom"] = _pool_geometry(pool)
+                else:
+                    a["missing"].append(layer_id)
+
+        lines = [
+            f"=== V4 KV pool self-check ({len(compress_ratios)} layers: "
+            f"{n_csa} CSA, {n_hca} HCA, {n_dense} dense) ==="
+        ]
+        all_ok = True
+        for name in (
+            "SWA_KV",
+            "CSA_KV",
+            "HCA_KV",
+            "INDEXER_KV",
+            "CSA_STATE",
+            "HCA_STATE",
+            "INDEXER_STATE",
+        ):
+            a = agg.get(name)
+            if a is None:
+                continue
+            geom = a["geom"]
+            geom_s = (
+                f"blocks={geom[0]} stride_bytes={geom[1]} dtype={geom[2]}"
+                if geom
+                else "geom=?"
+            )
+            ok = a["have"] == a["expect"]
+            all_ok = all_ok and ok
+            lines.append(
+                f"  {name:<14} {a['have']}/{a['expect']} layers  {geom_s}  "
+                f"[{'OK' if ok else 'MISSING'}]"
+            )
+            if a["missing"]:
+                shown = a["missing"][:16]
+                more = " ..." if len(a["missing"]) > 16 else ""
+                lines.append(f"      missing in layers: {shown}{more}")
+        lines.append(
+            "  [OK] all required regions present"
+            if all_ok
+            else "  [WARN] required regions MISSING — KV addressing will be wrong"
+        )
+        if no_pool_layers:
+            lines.append(
+                f"  note: {len(no_pool_layers)} layer(s) own no KV pool "
+                f"(MTP/non-attention, not checked): {no_pool_layers}"
+            )
+        # WARNING level so the banner stays visible with INFO/debug logs off.
+        logger.warning("\n".join(lines))
+    except Exception as e:  # never let a diagnostic break startup
+        logger.warning("V4 KV pool self-check failed (non-fatal): %s", e)
 
 
 def build_v4_block_tables(
