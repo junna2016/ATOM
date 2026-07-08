@@ -593,6 +593,34 @@ def _bind_v4_indexer_views(
     # contiguous state — our shadow buffers satisfy this.
 
 
+def _bind_v4_layer_pools(attn_module, cache_entry, ratio):
+    """Bind a layer's RTP pool views onto the ATOM V4 attention module.
+
+    Binds the SWA/compress cache views, the main compressor's CSA/HCA kv_cache,
+    and the indexer (144B direct-bind or FP8 shadow). Byte-identical across the
+    graph, eager-decode and prefill forward paths; each caller wraps this in its
+    own try/except with a path-specific fallback. Raises on any bind failure.
+    """
+    _bind_v4_kv_cache_views(attn_module, cache_entry.k_cache)
+    compressor = getattr(attn_module, "compressor", None)
+    if compressor is not None and ratio != 0:
+        head_dim = attn_module.head_dim
+        if ratio == 4:
+            csa_pool = cache_entry.k_cache.get("CSA_KV")
+            if csa_pool is not None:
+                compressor.kv_cache = csa_pool.kv_cache_base.view(
+                    torch.bfloat16
+                ).reshape(-1, attn_module.window_size // ratio, head_dim)
+        elif ratio == 128:
+            hca_pool = cache_entry.k_cache.get("HCA_KV")
+            if hca_pool is not None:
+                compressor.kv_cache = hca_pool.kv_cache_base.view(
+                    torch.bfloat16
+                ).reshape(-1, attn_module.window_size // ratio, head_dim)
+    if ratio == 4:
+        _bind_v4_indexer_views(attn_module, cache_entry.k_cache)
+
+
 def _v4_decode_state_gather(attn_module, ratio, active_bs, v4_block_tables, cache_entry):
     """Gather compressor kv_state/score_state from the RTP STATE pool into the
     compact per-slot buffers before forward_impl.
@@ -679,24 +707,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     cache_entry = kv_cache_data.get(f"layer_{self.layer_id}") if kv_cache_data else None
     if cache_entry and isinstance(cache_entry.k_cache, dict) and cache_entry.k_cache:
         try:
-            _bind_v4_kv_cache_views(self, cache_entry.k_cache)
-            compressor = getattr(self, "compressor", None)
-            if compressor is not None and ratio != 0:
-                head_dim = self.head_dim
-                if ratio == 4:
-                    csa_pool = cache_entry.k_cache.get("CSA_KV")
-                    if csa_pool is not None:
-                        compressor.kv_cache = csa_pool.kv_cache_base.view(
-                            torch.bfloat16
-                        ).reshape(-1, self.window_size // ratio, head_dim)
-                elif ratio == 128:
-                    hca_pool = cache_entry.k_cache.get("HCA_KV")
-                    if hca_pool is not None:
-                        compressor.kv_cache = hca_pool.kv_cache_base.view(
-                            torch.bfloat16
-                        ).reshape(-1, self.window_size // ratio, head_dim)
-            if ratio == 4:
-                _bind_v4_indexer_views(self, cache_entry.k_cache)
+            _bind_v4_layer_pools(self, cache_entry, ratio)
         except Exception as e:
             rate_limited_log(
                 f"v4_fallback:graph_bind:L{self.layer_id}",
@@ -984,24 +995,7 @@ def _patched_v4_forward(self, x, positions):
             and cache_entry.k_cache
         ):
             try:
-                _bind_v4_kv_cache_views(self, cache_entry.k_cache)
-                compressor = getattr(self, "compressor", None)
-                if compressor is not None and ratio != 0:
-                    head_dim = self.head_dim
-                    if ratio == 4:
-                        csa_pool = cache_entry.k_cache.get("CSA_KV")
-                        if csa_pool is not None:
-                            compressor.kv_cache = csa_pool.kv_cache_base.view(
-                                torch.bfloat16
-                            ).reshape(-1, self.window_size // ratio, head_dim)
-                    elif ratio == 128:
-                        hca_pool = cache_entry.k_cache.get("HCA_KV")
-                        if hca_pool is not None:
-                            compressor.kv_cache = hca_pool.kv_cache_base.view(
-                                torch.bfloat16
-                            ).reshape(-1, self.window_size // ratio, head_dim)
-                if ratio == 4:
-                    _bind_v4_indexer_views(self, cache_entry.k_cache)
+                _bind_v4_layer_pools(self, cache_entry, ratio)
             except Exception as e:
                 rate_limited_log(
                     f"v4_fallback:eager_bind:L{self.layer_id}",
@@ -1144,25 +1138,7 @@ def _patched_v4_forward(self, x, positions):
     cache_entry = kv_cache_data.get(f"layer_{self.layer_id}") if kv_cache_data else None
     if cache_entry and isinstance(cache_entry.k_cache, dict) and cache_entry.k_cache:
         try:
-            _bind_v4_kv_cache_views(self, cache_entry.k_cache)
-            # Bind compressor.kv_cache from RTP-LLM pool
-            compressor = getattr(self, "compressor", None)
-            if compressor is not None and ratio != 0:
-                head_dim = self.head_dim
-                if ratio == 4:
-                    csa_pool = cache_entry.k_cache.get("CSA_KV")
-                    if csa_pool is not None:
-                        compressor.kv_cache = csa_pool.kv_cache_base.view(
-                            torch.bfloat16
-                        ).reshape(-1, self.window_size // ratio, head_dim)
-                elif ratio == 128:
-                    hca_pool = cache_entry.k_cache.get("HCA_KV")
-                    if hca_pool is not None:
-                        compressor.kv_cache = hca_pool.kv_cache_base.view(
-                            torch.bfloat16
-                        ).reshape(-1, self.window_size // ratio, head_dim)
-            if ratio == 4:
-                _bind_v4_indexer_views(self, cache_entry.k_cache)
+            _bind_v4_layer_pools(self, cache_entry, ratio)
         except Exception as e:
             rate_limited_log(
                 f"v4_fallback:prefill_bind:L{self.layer_id}",
