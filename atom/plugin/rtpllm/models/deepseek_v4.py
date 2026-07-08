@@ -795,12 +795,31 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # buffers BEFORE graph capture. Without this, aiter allocates workspace
         # during capture (via regular PyTorch allocator); the memory may be freed
         # after capture ends and reused, causing graph replay to hit stale addresses.
+        #
+        # DeepseekV4ForCausalLM.forward stashes input_ids on
+        # forward_context.context for the V4 hash-MoE routing callback. That
+        # requires forward_context.context to be a real Context — production
+        # forwards get one via RTPForwardContext.bind(), but this standalone
+        # warmup runs outside bind(), so we install a minimal dummy Context here
+        # (and restore the previous one afterward). Without it the warmup crashes
+        # at ForCausalLM.forward's `ctx.context.input_ids = ...` before any layer
+        # runs, so no workspace is actually pre-allocated.
+        from atom.utils.forward_context import Context, get_forward_context
+
         try:
             dummy_bs = min(max_bs, 4)
             dummy_ids = torch.zeros(dummy_bs, dtype=torch.int64, device=device)
             dummy_pos = torch.zeros(dummy_bs, dtype=torch.int64, device=device)
-            with torch.no_grad():
-                self.model(input_ids=dummy_ids, positions=dummy_pos)
+            _fctx = get_forward_context()
+            _saved_context = _fctx.context
+            _fctx.context = Context(
+                positions=dummy_pos, input_ids=dummy_ids, is_dummy_run=True
+            )
+            try:
+                with torch.no_grad():
+                    self.model(input_ids=dummy_ids, positions=dummy_pos)
+            finally:
+                _fctx.context = _saved_context
             logger.info(
                 "ATOM V4 warmup eager forward done (pre-allocate MoE workspace)"
             )
