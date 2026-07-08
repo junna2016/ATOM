@@ -1496,6 +1496,53 @@ def _bind_v4_indexer_views(
     # contiguous state — our shadow buffers satisfy this.
 
 
+def _v4_decode_state_gather(attn_module, ratio, active_bs, v4_block_tables, cache_entry):
+    """Gather compressor kv_state/score_state from the RTP STATE pool into the
+    compact per-slot buffers before forward_impl.
+
+    Shared by the eager and CUDA-graph decode paths (identical logic). Returns
+    ``(state_pool_view, state_block_ids)`` for the matching scatter, or
+    ``(None, None)`` when there is nothing to sync (dense layer, empty batch,
+    missing pool, or a state layout that does not match the compact buffers).
+    """
+    compressor = getattr(attn_module, "compressor", None)
+    if compressor is None or ratio == 0 or active_bs <= 0:
+        return None, None
+    state_region = CSA_STATE if ratio == 4 else HCA_STATE
+    state_bt = v4_block_tables.get(state_region)
+    if state_bt is None or cache_entry is None or not cache_entry.k_cache:
+        return None, None
+    sp = cache_entry.k_cache.get("CSA_STATE" if ratio == 4 else "HCA_STATE")
+    if sp is None:
+        return None, None
+    pool_raw = sp.kv_cache_base.view(torch.float32)
+    n_blocks = pool_raw.shape[0]
+    elems = pool_raw.numel() // n_blocks
+    pool_view = pool_raw.reshape(n_blocks, elems)
+    block_ids = state_bt[:active_bs, 0].to(torch.int64)
+    half = elems // 2
+    ring = compressor.kv_state.shape[1]
+    dim = compressor.kv_state.shape[2]
+    if half != ring * dim:
+        return None, None
+    gathered = pool_view[block_ids]
+    compressor.kv_state[:active_bs] = gathered[:, :half].reshape(active_bs, ring, dim)
+    compressor.score_state[:active_bs] = gathered[:, half:].reshape(active_bs, ring, dim)
+    return pool_view, block_ids
+
+
+def _v4_decode_state_scatter(attn_module, state_pool_view, state_block_ids, active_bs):
+    """Scatter compact compressor kv_state/score_state back to the RTP STATE
+    pool after forward_impl. No-op when the paired gather returned (None, None).
+    """
+    compressor = getattr(attn_module, "compressor", None)
+    if state_pool_view is None or state_block_ids is None or compressor is None:
+        return
+    kv_flat = compressor.kv_state[:active_bs].reshape(active_bs, -1)
+    sc_flat = compressor.score_state[:active_bs].reshape(active_bs, -1)
+    state_pool_view[state_block_ids] = torch.cat([kv_flat, sc_flat], dim=-1)
+
+
 def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     """CUDA Graph fast-path for V4 attention layers.
 
@@ -1677,32 +1724,9 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         self.swa_kv[:active_bs].copy_(_pool_swa.index_select(0, _bid))
 
     # --- STATE pool gather: pool → compact kv_state/score_state ---
-    _state_pool_view_g = None
-    _state_block_ids_g = None
-    compressor = getattr(self, "compressor", None)
-    if compressor is not None and ratio != 0 and active_bs > 0:
-        _state_region = CSA_STATE if ratio == 4 else HCA_STATE
-        _state_bt = v4_block_tables.get(_state_region)
-        if _state_bt is not None and cache_entry is not None and cache_entry.k_cache:
-            _state_pool_name = "CSA_STATE" if ratio == 4 else "HCA_STATE"
-            _sp = cache_entry.k_cache.get(_state_pool_name)
-            if _sp is not None:
-                _state_pool_raw = _sp.kv_cache_base.view(torch.float32)
-                _n_blocks = _state_pool_raw.shape[0]
-                _elems = _state_pool_raw.numel() // _n_blocks
-                _state_pool_view_g = _state_pool_raw.reshape(_n_blocks, _elems)
-                _state_block_ids_g = _state_bt[:active_bs, 0].to(torch.int64)
-                _half = _elems // 2
-                _ring = compressor.kv_state.shape[1]
-                _dim = compressor.kv_state.shape[2]
-                if _half == _ring * _dim:
-                    _gathered = _state_pool_view_g[_state_block_ids_g]
-                    compressor.kv_state[:active_bs] = _gathered[:, :_half].reshape(
-                        active_bs, _ring, _dim
-                    )
-                    compressor.score_state[:active_bs] = _gathered[:, _half:].reshape(
-                        active_bs, _ring, _dim
-                    )
+    _state_pool_view_g, _state_block_ids_g = _v4_decode_state_gather(
+        self, ratio, active_bs, v4_block_tables, cache_entry
+    )
 
     try:
         result = self.forward_impl(x, positions)
@@ -1721,17 +1745,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         _bid = _block_ids[:active_bs]
         _pool_swa.index_copy_(0, _bid, self.swa_kv[:active_bs])
     # STATE scatter
-    if (
-        _state_pool_view_g is not None
-        and _state_block_ids_g is not None
-        and compressor is not None
-    ):
-        _ring = compressor.kv_state.shape[1]
-        _dim = compressor.kv_state.shape[2]
-        _kv_flat = compressor.kv_state[:active_bs].reshape(active_bs, -1)
-        _sc_flat = compressor.score_state[:active_bs].reshape(active_bs, -1)
-        _combined = torch.cat([_kv_flat, _sc_flat], dim=-1)
-        _state_pool_view_g[_state_block_ids_g] = _combined
+    _v4_decode_state_scatter(self, _state_pool_view_g, _state_block_ids_g, active_bs)
 
     return result
 
@@ -1949,63 +1963,12 @@ def _patched_v4_forward(self, x, positions):
                     self.indexer._rtp_score_bt_patched = True
 
         # --- STATE pool gather: pool → compact kv_state/score_state ---
-        # RTP-LLM manages STATE pool lifecycle (alloc/free/zero-init).
-        # We gather state from pool BEFORE forward_impl so compressor reads
-        # correct accumulated state. After forward_impl, scatter back.
-        from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import CSA_STATE, HCA_STATE
-
-        _state_pool_view = None
-        _state_block_ids = None
-        compressor = getattr(self, "compressor", None)
-        if compressor is not None and ratio != 0 and active_bs > 0:
-            _state_region = CSA_STATE if ratio == 4 else HCA_STATE
-            _state_bt = v4_block_tables.get(_state_region)
-            if _state_bt is not None and cache_entry is not None:
-                _state_pool_name = "CSA_STATE" if ratio == 4 else "HCA_STATE"
-                _sp = (
-                    cache_entry.k_cache.get(_state_pool_name)
-                    if cache_entry.k_cache
-                    else None
-                )
-                if _sp is not None:
-                    _state_pool_raw = _sp.kv_cache_base.view(torch.float32)
-                    _n_blocks = _state_pool_raw.shape[0]
-                    _elems = _state_pool_raw.numel() // _n_blocks
-                    _state_pool_view = _state_pool_raw.reshape(_n_blocks, _elems)
-                    _state_block_ids = _state_bt[:active_bs, 0].to(torch.int64)
-                    # Gather
-                    _gathered = _state_pool_view[_state_block_ids]  # [bs, elems]
-                    _half = _elems // 2
-                    _ring = compressor.kv_state.shape[1]
-                    _dim = compressor.kv_state.shape[2]
-                    if _half == _ring * _dim:
-                        compressor.kv_state[:active_bs] = _gathered[:, :_half].reshape(
-                            active_bs, _ring, _dim
-                        )
-                        compressor.score_state[:active_bs] = _gathered[
-                            :, _half:
-                        ].reshape(active_bs, _ring, _dim)
-                        if self.layer_id == 2:
-                            logger.debug(
-                                "DECODE STATE GATHER layer=%d: state_bid=%s",
-                                self.layer_id,
-                                _state_block_ids.tolist(),
-                            )
-                    else:
-                        if self.layer_id == 2:
-                            logger.debug(
-                                "DECODE STATE GATHER SKIP layer=%d: half=%d ring*dim=%d",
-                                self.layer_id,
-                                _half,
-                                _ring * _dim,
-                            )
-            else:
-                if self.layer_id == 2:
-                    logger.debug(
-                        "DECODE STATE: no state_bt or cache_entry. state_bt=%s cache_entry=%s",
-                        _state_bt is not None,
-                        cache_entry is not None,
-                    )
+        # RTP-LLM manages STATE pool lifecycle (alloc/free/zero-init). We gather
+        # state BEFORE forward_impl so the compressor reads correct accumulated
+        # state, then scatter back after. Shared with the CUDA-graph path.
+        _state_pool_view, _state_block_ids = _v4_decode_state_gather(
+            self, ratio, active_bs, v4_block_tables, cache_entry
+        )
 
         # Gather: pool[block_ids] → compact swa_kv, ONLY for valid-col0 rows.
         # Rows whose SWA col0 is a freed slot keep their self-maintained ring.
@@ -2036,17 +1999,7 @@ def _patched_v4_forward(self, x, positions):
             _src = self.swa_kv.index_select(0, _swa_rows)
             _pool_swa.index_copy_(0, _bid_valid, _src)
         # STATE scatter
-        if (
-            _state_pool_view is not None
-            and _state_block_ids is not None
-            and compressor is not None
-        ):
-            _ring = compressor.kv_state.shape[1]
-            _dim = compressor.kv_state.shape[2]
-            _kv_flat = compressor.kv_state[:active_bs].reshape(active_bs, -1)
-            _sc_flat = compressor.score_state[:active_bs].reshape(active_bs, -1)
-            _combined = torch.cat([_kv_flat, _sc_flat], dim=-1)
-            _state_pool_view[_state_block_ids] = _combined
+        _v4_decode_state_scatter(self, _state_pool_view, _state_block_ids, active_bs)
 
         return result
 
