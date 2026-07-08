@@ -30,6 +30,7 @@ from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
     HCA_STATE,
     select_block_table_for_region,
 )
+from atom.plugin.rtpllm.utils.v4_observability import rate_limited_log
 
 logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.rtp_v4_attention")
 
@@ -1615,7 +1616,14 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
             if ratio == 4:
                 _bind_v4_indexer_views(self, cache_entry.k_cache)
         except Exception as e:
-            logger.error("V4 graph bind layer %d: %s", self.layer_id, e, exc_info=True)
+            rate_limited_log(
+                f"v4_fallback:graph_bind:L{self.layer_id}",
+                logging.ERROR,
+                "graph bind failed — layer %d output ZEROED (garbage): %s",
+                self.layer_id,
+                e,
+                exc_info_first=True,
+            )
             return torch.zeros_like(x)
 
     # After bind: override swa_kv and unified_kv with compact buffer.
@@ -1745,12 +1753,14 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     try:
         result = self.forward_impl(x, positions)
     except Exception as e:
-        logger.error(
-            "V4 graph fwd layer %d (ratio=%d): %s",
+        rate_limited_log(
+            f"v4_fallback:graph_fwd:L{self.layer_id}",
+            logging.ERROR,
+            "graph forward failed — layer %d (ratio=%d) output ZEROED (garbage): %s",
             self.layer_id,
             ratio,
             e,
-            exc_info=True,
+            exc_info_first=True,
         )
         return torch.zeros_like(x)
 
@@ -1831,6 +1841,13 @@ def _patched_v4_forward(self, x, positions):
                 if not _triton_ok:
                     setattr(attn_md, _V4_META_BUILT_ATTR, True)
                     setattr(attn_md, _V4_META_FAILED_ATTR, True)
+                    rate_limited_log(
+                        f"v4_fallback:eager_meta_triton:L{self.layer_id}",
+                        logging.ERROR,
+                        "eager decode Triton metadata build returned False — "
+                        "layer %d output ZEROED (garbage)",
+                        self.layer_id,
+                    )
                     return torch.zeros_like(x)
             else:
                 # PREFILL: use original CPU metadata construction
@@ -1845,10 +1862,14 @@ def _patched_v4_forward(self, x, positions):
                     pool_swa_pages=getattr(self, "_rtp_swa_pages", 0),
                 )
         except Exception as e:
-            logger.error(
-                "V4 metadata construction failed: %s — using zeros fallback",
+            rate_limited_log(
+                f"v4_fallback:eager_meta_build:L{self.layer_id}",
+                logging.ERROR,
+                "eager metadata construction failed — layer %d output ZEROED "
+                "(garbage): %s",
+                self.layer_id,
                 e,
-                exc_info=True,
+                exc_info_first=True,
             )
             setattr(attn_md, _V4_META_BUILT_ATTR, True)
             setattr(attn_md, _V4_META_FAILED_ATTR, True)
@@ -1900,8 +1921,14 @@ def _patched_v4_forward(self, x, positions):
                 if ratio == 4:
                     _bind_v4_indexer_views(self, cache_entry.k_cache)
             except Exception as e:
-                logger.error(
-                    "V4 eager decode bind layer %d: %s", self.layer_id, e, exc_info=True
+                rate_limited_log(
+                    f"v4_fallback:eager_bind:L{self.layer_id}",
+                    logging.ERROR,
+                    "eager decode bind failed — layer %d output ZEROED "
+                    "(garbage): %s",
+                    self.layer_id,
+                    e,
+                    exc_info_first=True,
                 )
                 return torch.zeros_like(x)
 
@@ -1996,12 +2023,15 @@ def _patched_v4_forward(self, x, positions):
         try:
             result = self.forward_impl(x, positions)
         except Exception as e:
-            logger.error(
-                "V4 eager decode fwd layer %d (ratio=%d): %s",
+            rate_limited_log(
+                f"v4_fallback:eager_fwd:L{self.layer_id}",
+                logging.ERROR,
+                "eager decode forward failed — layer %d (ratio=%d) output "
+                "ZEROED (garbage): %s",
                 self.layer_id,
                 ratio,
                 e,
-                exc_info=True,
+                exc_info_first=True,
             )
             return torch.zeros_like(x)
 
@@ -2052,9 +2082,15 @@ def _patched_v4_forward(self, x, positions):
             if ratio == 4:
                 _bind_v4_indexer_views(self, cache_entry.k_cache)
         except Exception as e:
-            if not getattr(attn_md, "_v4_bind_err", False):
-                logger.error("V4 bind layer %d: %s", self.layer_id, e, exc_info=True)
-                attn_md._v4_bind_err = True
+            rate_limited_log(
+                f"v4_fallback:prefill_bind:L{self.layer_id}",
+                logging.ERROR,
+                "prefill bind failed — layer %d falling back to dummy-run "
+                "forward (degraded output): %s",
+                self.layer_id,
+                e,
+                exc_info_first=True,
+            )
             fc.context.is_dummy_run = True
             return self.forward_impl(x, positions)
     attn_md.compress_kv = getattr(self, "_rtp_compress_kv", None)
@@ -2300,8 +2336,15 @@ def _patched_v4_forward(self, x, positions):
 
         return result
     except Exception as e:
-        logger.error(
-            "V4 fwd layer %d (ratio=%d): %s", self.layer_id, ratio, e, exc_info=True
+        rate_limited_log(
+            f"v4_fallback:prefill_fwd:L{self.layer_id}",
+            logging.ERROR,
+            "prefill forward failed — layer %d (ratio=%d) output ZEROED "
+            "(garbage): %s",
+            self.layer_id,
+            ratio,
+            e,
+            exc_info_first=True,
         )
         return torch.zeros_like(x)
 
