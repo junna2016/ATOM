@@ -38,6 +38,22 @@ _ATOM_INDEXER_FP8_ENTRY_BYTES = 144
 _RTP_INDEXER_BF16_ENTRY_BYTES = 256
 _RTP_INDEXER_FP8_ENTRY_BYTES = 132
 
+# One-time (per process) guard for the INDEXER_KV binding-mode banner, so an
+# operator can confirm from the log whether the ROCm ATOM 144B direct-bind is
+# active even with INFO/debug logs off — logged exactly once, not per CSA layer.
+_INDEXER_BIND_LOGGED = False
+
+
+def _indexer_fp8_144_kv_requested() -> bool:
+    """True iff the ROCm ATOM 144B INDEXER_KV direct-bind was requested via env."""
+    return os.environ.get("ROCM_ATOM_DSV4_INDEXER_FP8_KV_CACHE", "0") in (
+        "1",
+        "true",
+        "True",
+        "ON",
+        "on",
+    )
+
 # ---------------------------------------------------------------------------
 # Dual-ptr paged decode kernel (plugin-only, does NOT modify ATOM native code)
 # ---------------------------------------------------------------------------
@@ -407,14 +423,6 @@ def _ensure_v4_native_buffers(
         or attn_module._compact_swa_kv is None
     ):
         attn_module._compact_swa_kv = attn_module.swa_kv
-    logger.debug(
-        "Allocated V4 native buffers for layer %d: swa_kv=[%d,%d,%d] ratio=%d",
-        attn_module.layer_id,
-        num_slots,
-        window_size,
-        head_dim,
-        ratio,
-    )
 
 
 def _reset_v4_state_all(attn_module: Any) -> None:
@@ -1305,13 +1313,7 @@ def _try_bind_v4_indexer_rtp_pool_144(
     """Bind ROCm ATOM 144B INDEXER_KV pool directly when available."""
     if torch.version.hip is None:
         return False
-    if os.environ.get("ROCM_ATOM_DSV4_INDEXER_FP8_KV_CACHE", "0") not in (
-        "1",
-        "true",
-        "True",
-        "ON",
-        "on",
-    ):
+    if not _indexer_fp8_144_kv_requested():
         return False
 
     base = getattr(kv_pool, "kv_cache_base", None)
@@ -1353,15 +1355,20 @@ def _try_bind_v4_indexer_rtp_pool_144(
             )
         )
 
-    if not getattr(indexer, "_rtp_idx_kv_pool_144_logged", False):
-        logger.info(
-            "V4 INDEXER_KV binding=rtp_pool_144 layer=%s blocks=%d entries_per_block=%d stride_bytes=%d",
+    global _INDEXER_BIND_LOGGED
+    if not _INDEXER_BIND_LOGGED:
+        # Printed once per process at WARNING so it stays visible with INFO/debug
+        # logs off — positive confirmation the 144B direct-bind is active (no
+        # code path here is an error).
+        logger.warning(
+            "V4 INDEXER_KV 144B direct-bind ACTIVE (binding=rtp_pool_144) "
+            "first_layer=%s blocks=%d entries_per_block=%d stride_bytes=%d",
             getattr(attn_module, "layer_id", "?"),
             num_blocks,
             entries_per_block,
             stride_bytes,
         )
-        indexer._rtp_idx_kv_pool_144_logged = True
+        _INDEXER_BIND_LOGGED = True
     return True
 
 
@@ -1463,17 +1470,24 @@ def _bind_v4_indexer_views(
             NB, k1, aligned_dim, dtype=fp8_dtype, device=kv_pool.kv_cache_base.device
         )
         indexer._rtp_idx_kv_shadow = shadow_kv
-        if not getattr(indexer, "_rtp_idx_kv_shadow_logged", False):
-            logger.info(
-                "V4 INDEXER_KV binding=shadow_fallback layer=%s blocks=%d entries_per_block=%d",
-                getattr(attn_module, "layer_id", "?"),
-                NB,
-                k1,
-            )
-            indexer._rtp_idx_kv_shadow_logged = True
 
     # Bind kv_cache for both Indexer and its inner Compressor
     indexer.kv_cache = shadow_kv
+
+    global _INDEXER_BIND_LOGGED
+    if not _INDEXER_BIND_LOGGED and _indexer_fp8_144_kv_requested():
+        # env requested the 144B direct-bind but we fell back to the shadow —
+        # an unexpected degradation worth one WARNING. When the env is NOT set,
+        # shadow is the intended path, so stay silent (no false alarm).
+        logger.warning(
+            "V4 INDEXER_KV requested 144B direct-bind but FELL BACK to shadow "
+            "(binding=shadow_fallback) first_layer=%s blocks=%d entries_per_block=%d "
+            "— check INDEXER_KV pool layout / global fp8_kv_cache",
+            getattr(attn_module, "layer_id", "?"),
+            NB,
+            k1,
+        )
+        _INDEXER_BIND_LOGGED = True
 
     idx_compressor = getattr(indexer, "compressor", None)
     if idx_compressor is not None:

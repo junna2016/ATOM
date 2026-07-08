@@ -112,11 +112,11 @@ def get_pool_for_layer_region(
         region_enum = _REGION_TO_ENUM.get(region)
         if region_enum is not None:
             return kv_cache.get_layer_cache(layer_id, region_enum)
-    except Exception as e:
-        if layer_id == 0:
-            logger.debug(
-                "get_pool_for_layer_region(%d, %d) failed: %s", layer_id, region, e
-            )
+    except Exception:
+        # Expected control flow: a layer legitimately does not own every region
+        # (e.g. dense layers own no CSA/HCA pool). Return None silently — this is
+        # not an error, so do not log it.
+        pass
     return None
 
 
@@ -143,30 +143,6 @@ def build_v4_kv_cache_tensors(
         raise ValueError("V4 plugin requires initialized kv_cache.")
 
     region_to_group = build_region_to_group_map(kv_cache)
-    logger.debug(
-        "V4 KV cache: type=%s, group_region_names=%s, region_to_group=%s, attrs=%s",
-        type(kv_cache).__name__,
-        getattr(kv_cache, "group_region_names", "MISSING"),
-        region_to_group,
-        [
-            a
-            for a in dir(kv_cache)
-            if not a.startswith("_")
-            and (
-                "cache" in a.lower()
-                or "group" in a.lower()
-                or "region" in a.lower()
-                or "layer" in a.lower()
-            )
-        ],
-    )
-    # Log pool structure once for debugging
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "V4 KV cache: %d groups, region_to_group=%s",
-            len(region_to_group),
-            region_to_group,
-        )
 
     if not region_to_group:
         logger.warning(
