@@ -19,14 +19,78 @@ from atom.config import KVCacheTensor
 
 logger = logging.getLogger("atom.plugin.rtpllm.utils.v4_kv_cache_bridge")
 
-# Mirror RTP-LLM's KVCacheRegionName enum (CacheGroupType.h)
-SWA_KV = 7
-CSA_KV = 1
-HCA_KV = 2
-INDEXER_KV = 3
-INDEXER_STATE = 4
-CSA_STATE = 5
-HCA_STATE = 6
+# Region ids mirror RTP-LLM's KVCacheRegionName enum (CacheGroupType.h). We
+# derive them from the pybind enum at import time so a value change on the RTP
+# side propagates automatically — a stale hardcoded literal would silently point
+# ATOM at the wrong pool (corrupting KV addressing) after a rebase. When the RTP
+# ops module isn't importable (e.g. unit tests outside a server process) we fall
+# back to the known literals so the module still imports.
+_REGION_NAME_KEYS = (
+    "SWA_KV",
+    "CSA_KV",
+    "HCA_KV",
+    "INDEXER_KV",
+    "INDEXER_STATE",
+    "CSA_STATE",
+    "HCA_STATE",
+)
+_FALLBACK_REGION_IDS = {
+    "SWA_KV": 7,
+    "CSA_KV": 1,
+    "HCA_KV": 2,
+    "INDEXER_KV": 3,
+    "INDEXER_STATE": 4,
+    "CSA_STATE": 5,
+    "HCA_STATE": 6,
+}
+
+# {int region id -> pybind KVCacheRegionName member}; populated from the enum at
+# import when available, so get_pool_for_layer_region needs no per-call import.
+_REGION_TO_ENUM: Dict[int, Any] = {}
+
+
+def _resolve_region_ids() -> Dict[str, int]:
+    try:
+        from rtp_llm.ops.compute_ops import KVCacheRegionName
+    except Exception:
+        return dict(_FALLBACK_REGION_IDS)
+    ids: Dict[str, int] = {}
+    for name in _REGION_NAME_KEYS:
+        member = getattr(KVCacheRegionName, name, None)
+        if member is None:
+            # Member renamed/removed on the RTP side — a silent mismatch here
+            # would corrupt KV addressing, so warn and fall back for this one.
+            logger.warning(
+                "KVCacheRegionName has no member %s; using fallback id %d",
+                name,
+                _FALLBACK_REGION_IDS[name],
+            )
+            ids[name] = _FALLBACK_REGION_IDS[name]
+            continue
+        rid = int(member)
+        ids[name] = rid
+        _REGION_TO_ENUM[rid] = member
+        if rid != _FALLBACK_REGION_IDS[name]:
+            # Real desync: RTP renumbered this region. Surface it loudly (ATOM
+            # adopts the live RTP value, which is correct, but you want to know).
+            logger.warning(
+                "RTP KVCacheRegionName.%s=%d differs from ATOM's expected %d "
+                "— adopting the RTP value",
+                name,
+                rid,
+                _FALLBACK_REGION_IDS[name],
+            )
+    return ids
+
+
+_REGION_IDS = _resolve_region_ids()
+SWA_KV = _REGION_IDS["SWA_KV"]
+CSA_KV = _REGION_IDS["CSA_KV"]
+HCA_KV = _REGION_IDS["HCA_KV"]
+INDEXER_KV = _REGION_IDS["INDEXER_KV"]
+INDEXER_STATE = _REGION_IDS["INDEXER_STATE"]
+CSA_STATE = _REGION_IDS["CSA_STATE"]
+HCA_STATE = _REGION_IDS["HCA_STATE"]
 
 # Human-readable names for logging
 _REGION_NAMES = {
@@ -96,28 +160,18 @@ def get_pool_for_layer_region(
     Returns:
         LayerKVCache object with .kv_cache_base attribute, or None
     """
+    # _REGION_TO_ENUM is built once at import from the pybind enum (empty when
+    # the RTP ops module is unavailable, in which case there is nothing to bind).
+    region_enum = _REGION_TO_ENUM.get(region)
+    if region_enum is None:
+        return None
     try:
-        from rtp_llm.ops.compute_ops import KVCacheRegionName
-
-        # Map int region id to pybind11 KVCacheRegionName enum
-        _REGION_TO_ENUM = {
-            1: KVCacheRegionName.CSA_KV,
-            2: KVCacheRegionName.HCA_KV,
-            3: KVCacheRegionName.INDEXER_KV,
-            4: KVCacheRegionName.INDEXER_STATE,
-            5: KVCacheRegionName.CSA_STATE,
-            6: KVCacheRegionName.HCA_STATE,
-            7: KVCacheRegionName.SWA_KV,
-        }
-        region_enum = _REGION_TO_ENUM.get(region)
-        if region_enum is not None:
-            return kv_cache.get_layer_cache(layer_id, region_enum)
+        return kv_cache.get_layer_cache(layer_id, region_enum)
     except Exception:
         # Expected control flow: a layer legitimately does not own every region
         # (e.g. dense layers own no CSA/HCA pool). Return None silently — this is
         # not an error, so do not log it.
-        pass
-    return None
+        return None
 
 
 def build_v4_kv_cache_tensors(
