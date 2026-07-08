@@ -733,7 +733,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             )
             head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
 
-            import atom.plugin.rtpllm.attention_backend.rtp_v4_attention as _v4_attn
+            import atom.plugin.rtpllm.attention_backend.rtp_dsv4_attention as _v4_attn
 
             if swa_pool is not None:
                 _swa_raw = swa_pool.kv_cache_base
