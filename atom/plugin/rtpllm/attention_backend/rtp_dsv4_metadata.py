@@ -368,7 +368,17 @@ def _build_v4_per_forward_metadata(
     # -- state_slot_mapping from SWA_KV block table (fixed alloc, 1 block = 1 slot) --
     swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
     if swa_bt is not None and swa_bt.numel() >= bs:
-        _ssm = swa_bt[:bs, 0].to(dtype=torch.int32, device=device)
+        # clamp to >=0: for a prompt longer than 2*win the SWA col0 is a FREED
+        # slot (-1). Using -1 as state_slot_mapping makes the Python compressor
+        # STATE scatter index kv_state[-1] (negative index -> LAST shadow slot)
+        # while the compress kernel clamps -1 -> 0, so the scatter reads a
+        # different slot than the kernel wrote. The stale slot's contents (a
+        # previous request's compressor state) then get scattered into the STATE
+        # pool and gathered by the next request -> cross-request contamination
+        # (request B answers request A) for any prompt > 2*win. Clamping aligns
+        # both to slot 0. SWA KV write is unaffected: its kernel already clamps
+        # -1 -> 0 internally.
+        _ssm = torch.clamp(swa_bt[:bs, 0], min=0).to(dtype=torch.int32, device=device)
         attn_md.state_slot_mapping = _ssm.as_strided(_ssm.shape, (1,) * _ssm.dim())
         attn_md.state_slot_mapping_cpu = attn_md.state_slot_mapping.cpu().numpy().copy()
     else:
