@@ -368,17 +368,34 @@ def _build_v4_per_forward_metadata(
     # -- state_slot_mapping from SWA_KV block table (fixed alloc, 1 block = 1 slot) --
     swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
     if swa_bt is not None and swa_bt.numel() >= bs:
-        # clamp to >=0: for a prompt longer than 2*win the SWA col0 is a FREED
-        # slot (-1). Using -1 as state_slot_mapping makes the Python compressor
-        # STATE scatter index kv_state[-1] (negative index -> LAST shadow slot)
-        # while the compress kernel clamps -1 -> 0, so the scatter reads a
-        # different slot than the kernel wrote. The stale slot's contents (a
-        # previous request's compressor state) then get scattered into the STATE
-        # pool and gathered by the next request -> cross-request contamination
-        # (request B answers request A) for any prompt > 2*win. Clamping aligns
-        # both to slot 0. SWA KV write is unaffected: its kernel already clamps
-        # -1 -> 0 internally.
-        _ssm = torch.clamp(swa_bt[:bs, 0], min=0).to(dtype=torch.int32, device=device)
+        # state_slot per sequence (indexes the compressor STATE shadow AND the
+        # SWA write). Normally this is the SWA block-table col0. For a prompt
+        # longer than 2*win, col0 is a FREED slot (-1); naively clamping every
+        # such sequence to 0 makes them all share state slot 0, so:
+        #   - sequentially, the Python STATE scatter's kv_state[-1] negative
+        #     index (vs the kernel's -1->0 clamp) mismatched -> a prior request's
+        #     state leaked into the STATE pool (cross-request contamination); and
+        #   - concurrently, multiple >2*win prompts collide on shadow slot 0,
+        #     corrupting each other's compressor state (degeneration).
+        # Fix: keep col0 for live sequences (unchanged), but for a FREED col0 use
+        # that sequence's CURRENT (newest, last non-negative column) SWA block —
+        # a live, per-sequence-DISTINCT, valid block. Concurrent long prompts get
+        # distinct physical blocks from RTP, so their state slots no longer clash.
+        _raw = swa_bt[:bs]
+        _cols = int(_raw.shape[1])
+        _colidx = torch.arange(_cols, device=_raw.device, dtype=_raw.dtype).unsqueeze(0)
+        _last_valid_col = (
+            torch.where(_raw >= 0, _colidx, torch.full_like(_raw, -1))
+            .max(dim=1)
+            .values.clamp(min=0)
+        )
+        _cur_block = _raw.gather(1, _last_valid_col.long().unsqueeze(1)).squeeze(1)
+        _col0 = swa_bt[:bs, 0]
+        _ssm = (
+            torch.where(_col0 >= 0, _col0, _cur_block)
+            .clamp(min=0)
+            .to(dtype=torch.int32, device=device)
+        )
         attn_md.state_slot_mapping = _ssm.as_strided(_ssm.shape, (1,) * _ssm.dim())
         attn_md.state_slot_mapping_cpu = attn_md.state_slot_mapping.cpu().numpy().copy()
     else:
