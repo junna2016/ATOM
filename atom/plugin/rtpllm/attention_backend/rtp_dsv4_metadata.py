@@ -229,18 +229,31 @@ def _build_eager_decode_with_triton(
     ).to(device=device)
     attn_md._eager_triton_active_bs = bs
 
-    # Rows whose SWA col0 is a VALID (non-freed) block. block_ids_raw_np < 0
-    # marks a freed slot (the sequence has crossed its first sliding-window
-    # boundary, pos>=2*win): the pool holds no live SWA data there and the pool
-    # code clamps -1 to physical block 0. Syncing those rows would gather stale
-    # block-0 KV into the compact ring (one-step corruption → a glitch token)
-    # and scatter the ring onto block 0, polluting whatever request owns it in a
-    # batch. We skip pool<->ring sync for freed rows and let the ring
-    # self-maintain via swa_write — the last valid gather already seeded it.
-    _valid_rows_np = np.nonzero(block_ids_raw_np >= 0)[0].astype(np.int64)
+    # Rows eligible for the per-step col0 ring gather/scatter. Only correct when
+    # the whole SWA window lies in col0, i.e. pos < win: then col0 holds exactly
+    # the window. For pos >= win the window spans cur_col/prev_col (col0 may be
+    # freed to -1 past 2*win), so col0-only sync would read the WRONG block; those
+    # rows are seeded by the one-shot multi-block split seed in the eager forward
+    # instead. (block_ids_raw_np < 0 = freed col0; the pool clamps -1 to block 0,
+    # syncing which would corrupt the ring / pollute block 0 in a bs>1 batch.)
+    _valid_rows_np = np.nonzero(
+        (block_ids_raw_np >= 0) & (positions_np[:bs] < win)
+    )[0].astype(np.int64)
     attn_md._eager_swa_gather_rows = torch.from_numpy(_valid_rows_np).to(device=device)
     attn_md._eager_triton_swa_pages = swa_pages_val
     attn_md._eager_triton_positions = positions_gpu
+
+    # Full SWA block table + positions (CPU) for the eager one-shot multi-block
+    # split seed: for pos >= win the live window spans cur_col/prev_col, which the
+    # col0-only gather above skips. Without this a long-prompt slot's compact ring
+    # is never seeded and serves stale / cross-request data (bs>1 contamination).
+    if swa_bt is not None and swa_bt.numel() >= bs:
+        attn_md._eager_swa_bt_cpu = (
+            swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+        )
+    else:
+        attn_md._eager_swa_bt_cpu = None
+    attn_md._eager_swa_positions_cpu = positions_np[:bs].copy()
 
     setattr(attn_md, _V4_META_BUILT_ATTR, True)
     return True

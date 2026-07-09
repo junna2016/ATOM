@@ -1087,9 +1087,53 @@ def _patched_v4_forward(self, x, positions):
             self, ratio, active_bs, v4_block_tables, cache_entry
         )
 
-        # Gather: pool[block_ids] → compact swa_kv, ONLY for valid-col0 rows.
-        # Rows whose SWA col0 is a freed slot keep their self-maintained ring.
         _pool_swa = getattr(self, "_rtp_pool_swa_kv", None)
+
+        # One-shot multi-block SWA seed at the first decode step of each request
+        # (mirrors the CUDA-graph seed). REQUIRED for a prompt > win: the live
+        # window spans cur_col/prev_col, but the per-step col0 gather below skips
+        # freed-col0 rows (pos>=2*win) and reads the wrong block for pos in
+        # [win,2*win). Without this a long-prompt slot's compact ring is never
+        # seeded from the pool -> it serves stale / another slot's data in a bs>1
+        # batch (cross-request contamination + degeneration). After seeding, the
+        # ring self-maintains via swa_write. Per-slot position-discontinuity gate
+        # so continuing requests keep their maintained ring.
+        _bt_cpu = getattr(attn_md, "_eager_swa_bt_cpu", None)
+        _pos_cpu = getattr(attn_md, "_eager_swa_positions_cpu", None)
+        if _pool_swa is not None and _bt_cpu is not None and _pos_cpu is not None:
+            _win = int(self.window_size)
+            _prev = getattr(self, "_eager_prev_seed_pos", None)
+            _cur = [int(p) for p in _pos_cpu]
+            if _prev is None:
+                _seed = [True] * len(_cur)
+            else:
+                _seed = [
+                    (i >= len(_prev)) or (c != _prev[i] + 1)
+                    for i, c in enumerate(_cur)
+                ]
+            self._eager_prev_seed_pos = _cur
+            _cols = _bt_cpu.shape[1]
+            _npool = _pool_swa.shape[0]
+            for _si in range(len(_cur)):
+                if not _seed[_si]:
+                    continue
+                _p = _cur[_si]
+                _split = _p % _win
+                _cc = _p // _win
+                _pc = _cc - 1
+                _cb = max(int(_bt_cpu[_si, min(_cc, _cols - 1)]), 0)
+                if _cc > 0:
+                    _pb = max(int(_bt_cpu[_si, min(_pc, _cols - 1)]), 0)
+                    # ring [0, split) from current block, [split, win) from prev
+                    if _split > 0 and _cb < _npool:
+                        self.swa_kv[_si, :_split].copy_(_pool_swa[_cb, :_split])
+                    if _pb < _npool:
+                        self.swa_kv[_si, _split:].copy_(_pool_swa[_pb, _split:])
+                elif _cb < _npool:
+                    # single block (pos < win): whole block is the window
+                    self.swa_kv[_si].copy_(_pool_swa[_cb])
+
+        # Per-step col0 ring gather (only pos<win rows now — see metadata).
         _swa_rows = getattr(attn_md, "_eager_swa_gather_rows", None)
         if _pool_swa is not None and _swa_rows is not None and _swa_rows.numel() > 0:
             _bid_valid = _triton_block_ids.index_select(0, _swa_rows)
