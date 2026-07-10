@@ -701,7 +701,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             "_index_topk": index_topk,
             "_max_committed_hca": max_committed_hca,
             "_active_bs": 0,
-            # References for graph-capture fallback pool binding
+            # References for graph-capture pool binding
             "_kv_cache_ref": kv_cache,
             "_kv_cache_ref_runtime": self,
         }
@@ -721,7 +721,7 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         )
         self._cg_v4_bufs["_state_slot_mapping_cpu"] = np.zeros(1, dtype=np.int32)
 
-        # Initialize runtime-scoped pool views for graph-capture fallback. There
+        # Initialize runtime-scoped pool views for graph capture. There
         # is no eager forward before capture, and process globals would retain
         # stale device pointers across model/KV-cache reloads.
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
@@ -731,53 +731,48 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             get_pool_for_layer_region,
         )
 
-        try:
-            swa_pool = get_pool_for_layer_region(kv_cache, 0, SWA_KV)
-            compress_ratios = getattr(self, "_compress_ratios", None)
-            if compress_ratios is None:
-                model = self.model
-                _args = getattr(model, "args", None) or getattr(
-                    getattr(model, "model", None), "args", None
-                )
-                compress_ratios = (
-                    list(getattr(_args, "compress_ratios", ())) if _args else []
-                )
-            csa_layer_id = next(
-                (i for i, r in enumerate(compress_ratios) if r == DSV4_CSA_RATIO),
-                None,
+        swa_pool = get_pool_for_layer_region(kv_cache, 0, SWA_KV)
+        compress_ratios = getattr(self, "_compress_ratios", None)
+        if compress_ratios is None:
+            model = self.model
+            _args = getattr(model, "args", None) or getattr(
+                getattr(model, "model", None), "args", None
             )
-            hca_layer_id = next(
-                (i for i, r in enumerate(compress_ratios) if r == DSV4_HCA_RATIO),
-                None,
+            compress_ratios = (
+                list(getattr(_args, "compress_ratios", ())) if _args else []
             )
-            csa_pool = (
-                get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV)
-                if csa_layer_id is not None
-                else None
-            )
-            hca_pool = (
-                get_pool_for_layer_region(kv_cache, hca_layer_id, HCA_KV)
-                if hca_layer_id is not None
-                else None
-            )
-            head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
+        csa_layer_id = next(
+            (i for i, r in enumerate(compress_ratios) if r == DSV4_CSA_RATIO), None
+        )
+        hca_layer_id = next(
+            (i for i, r in enumerate(compress_ratios) if r == DSV4_HCA_RATIO), None
+        )
+        csa_pool = (
+            get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV)
+            if csa_layer_id is not None
+            else None
+        )
+        hca_pool = (
+            get_pool_for_layer_region(kv_cache, hca_layer_id, HCA_KV)
+            if hca_layer_id is not None
+            else None
+        )
+        head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
 
-            pool_views = {}
-            if swa_pool is not None:
-                _swa_raw = swa_pool.kv_cache_base
-                pool_views["swa"] = _swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
-            if csa_pool is not None:
-                pool_views["csa"] = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(
-                    -1, head_dim
-                )
-            if hca_pool is not None:
-                pool_views["hca"] = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(
-                    -1, head_dim
-                )
-            self._cg_v4_bufs["_pool_views"] = pool_views
-            logger.info("Initialized pool view caches for graph capture fallback")
-        except Exception as e:
-            logger.warning("Failed to initialize pool view caches: %s", e)
+        pool_views = {}
+        if swa_pool is not None:
+            swa_raw = swa_pool.kv_cache_base
+            pool_views["swa"] = swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
+        if csa_pool is not None:
+            pool_views["csa"] = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(
+                -1, head_dim
+            )
+        if hca_pool is not None:
+            pool_views["hca"] = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(
+                -1, head_dim
+            )
+        self._cg_v4_bufs["_pool_views"] = pool_views
+        logger.info("Initialized pool view caches for graph capture")
 
         self._cg_layers_prewarmed = True
 
@@ -786,21 +781,20 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # happens BEFORE any eager call. Without this, fc.kv_cache_data=None
         # during capture → _bind_v4_kv_cache_views never runs → crash.
         if self._rtp_kv_cache_data is None:
-            try:
-                from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-                    build_v4_kv_cache_tensors,
-                    get_v4_compress_ratios,
-                )
+            from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
+                build_v4_kv_cache_tensors,
+                get_v4_compress_ratios,
+            )
 
-                _ratios = get_v4_compress_ratios(self)
-                if _ratios:
-                    self._rtp_kv_cache_data = build_v4_kv_cache_tensors(self, _ratios)
-                    logger.info(
-                        "Pre-built kv_cache_data for graph capture (%d layers)",
-                        len(_ratios),
-                    )
-            except Exception as e:
-                logger.warning("Failed to pre-build kv_cache_data: %s", e)
+            ratios = get_v4_compress_ratios(self)
+            if not ratios:
+                raise RuntimeError(
+                    "V4 graph capture requires non-empty compress ratios"
+                )
+            self._rtp_kv_cache_data = build_v4_kv_cache_tensors(self, ratios)
+            logger.info(
+                "Pre-built kv_cache_data for graph capture (%d layers)", len(ratios)
+            )
 
         logger.info(
             "ATOM V4 cuda-graph prewarmed "

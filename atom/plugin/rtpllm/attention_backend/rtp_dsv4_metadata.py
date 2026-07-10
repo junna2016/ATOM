@@ -48,7 +48,8 @@ def _build_eager_decode_with_triton(
     [0..bs-1], compact swa_kv buffer, and gather/scatter for pool sync.
 
     Does NOT modify any CUDA Graph state (_cg_v4_bufs etc.).
-    Returns True on success, False if fallback to CPU metadata is needed.
+    Returns True on success. An empty decode batch returns False; malformed
+    runtime metadata raises instead of constructing approximate indices.
     """
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
     from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
@@ -75,7 +76,7 @@ def _build_eager_decode_with_triton(
                 np.int32
             )
         else:
-            positions_np = np.zeros(bs, dtype=np.int32)
+            raise ValueError("V4 eager decode requires sequence lengths")
 
     # --- Block tables ---
     swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
@@ -86,12 +87,12 @@ def _build_eager_decode_with_triton(
     # Save original block IDs for gather/scatter. block_ids_raw_np keeps the
     # signed value: a freed SWA slot is -1, which we detect below to skip
     # pool<->ring sync for rows past their first window boundary.
-    if swa_bt is not None and swa_bt.numel() >= bs:
-        block_ids_raw_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
-        block_ids_np = np.maximum(block_ids_raw_np, 0)  # guard -1
-    else:
-        block_ids_raw_np = np.arange(bs, dtype=np.int32)
-        block_ids_np = block_ids_raw_np
+    if swa_bt is None or swa_bt.numel() < bs:
+        raise ValueError("V4 eager decode requires an SWA_KV block table")
+    if DSV4_HCA_RATIO in v4_ratios and (hca_bt is None or hca_bt.numel() < bs):
+        raise ValueError("V4 eager decode requires an HCA_KV block table")
+    block_ids_raw_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
+    block_ids_np = np.maximum(block_ids_raw_np, 0)  # guard -1
 
     # --- n_committed ---
     n_csa_np = ((positions_np + 1) // DSV4_CSA_RATIO).astype(np.int32)
@@ -153,7 +154,9 @@ def _build_eager_decode_with_triton(
     )
 
     # HCA compress tail (swa_pages + block_tables[bid, j])
-    swa_pages_val = pool_swa_pages if pool_swa_pages > 0 else bs * cs
+    if pool_swa_pages <= 0:
+        raise ValueError("V4 eager decode requires a positive SWA pool page count")
+    swa_pages_val = pool_swa_pages
     if hca_bt is not None and hca_bt.numel() >= bs:
         hca_bt_gpu = hca_bt[:bs].to(dtype=torch.int32, device=device)
         write_v4_decode_hca_compress_tail(
@@ -200,48 +203,47 @@ def _build_eager_decode_with_triton(
     attn_md.skip_prefix_len_csa = torch.zeros(bs, dtype=torch.int32, device=device)
 
     # --- compress_plans ---
+    extend_lens_cpu = np.ones(bs, dtype=np.int32)
+    context_lens_cpu = (positions_np + 1).astype(np.int32)
+    plan_bufs = {
+        DSV4_CSA_RATIO: {
+            "compress": CpuGpuBuffer(
+                max(1, bs),
+                DSV4_COMPRESS_PLAN_WIDTH,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "write": CpuGpuBuffer(
+                max(1, bs * 2 * DSV4_CSA_RATIO),
+                DSV4_COMPRESS_PLAN_WIDTH,
+                dtype=torch.int32,
+                device=device,
+            ),
+        },
+        DSV4_HCA_RATIO: {
+            "compress": CpuGpuBuffer(
+                max(1, bs),
+                DSV4_COMPRESS_PLAN_WIDTH,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "write": CpuGpuBuffer(
+                max(1, bs * DSV4_HCA_RATIO),
+                DSV4_COMPRESS_PLAN_WIDTH,
+                dtype=torch.int32,
+                device=device,
+            ),
+        },
+    }
     try:
-        extend_lens_cpu = np.ones(bs, dtype=np.int32)
-        context_lens_cpu = (positions_np + 1).astype(np.int32)
-        _plan_bufs = {
-            DSV4_CSA_RATIO: {
-                "compress": CpuGpuBuffer(
-                    max(1, bs),
-                    DSV4_COMPRESS_PLAN_WIDTH,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                "write": CpuGpuBuffer(
-                    max(1, bs * 2 * DSV4_CSA_RATIO),
-                    DSV4_COMPRESS_PLAN_WIDTH,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-            },
-            DSV4_HCA_RATIO: {
-                "compress": CpuGpuBuffer(
-                    max(1, bs),
-                    DSV4_COMPRESS_PLAN_WIDTH,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                "write": CpuGpuBuffer(
-                    max(1, bs * DSV4_HCA_RATIO),
-                    DSV4_COMPRESS_PLAN_WIDTH,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-            },
-        }
         attn_md.compress_plans = make_compress_plans(
             extend_lens_cpu,
             context_lens_cpu,
             [(DSV4_CSA_RATIO, True), (DSV4_HCA_RATIO, False)],
-            plan_buffers=_plan_bufs,
+            plan_buffers=plan_bufs,
         )
-    except Exception as e:
-        logger.warning("Eager decode Triton: compress_plans failed: %s", e)
-        attn_md.compress_plans = {}
+    except (RuntimeError, ValueError, TypeError) as e:
+        raise RuntimeError("failed to build V4 eager decode compression plans") from e
 
     # --- Store block_ids and positions for gather/scatter + state reset ---
     attn_md._eager_triton_block_ids = torch.from_numpy(

@@ -104,19 +104,19 @@ def _patched_sparse_attn_v4_paged_decode(
 
     Uses the kernel's native dual-pointer (SPLIT_KV) mode to read from
     separate SWA and compress pools without any buffer copy or allocation.
-    Falls back to torch.cat for eager non-graph mode (backward compat).
+    Dense/SWA-only layers call the original kernel without a compress pool.
     """
 
-    try:
-        from atom.utils.forward_context import get_forward_context
+    from atom.utils.forward_context import get_forward_context
 
-        fc = get_forward_context()
-        attn_md = getattr(fc, "attn_metadata", None)
-        compress_kv = getattr(attn_md, "compress_kv", None) if attn_md else None
-        swa_pages = getattr(attn_md, "swa_pages", 0) if attn_md else 0
-    except Exception:
-        compress_kv = None
-        swa_pages = 0
+    fc = get_forward_context()
+    attn_md = getattr(fc, "attn_metadata", None)
+    if attn_md is None:
+        raise V4AttentionRuntimeError(
+            "V4 paged decode requires bound forward attention metadata"
+        )
+    compress_kv = getattr(attn_md, "compress_kv", None)
+    swa_pages = getattr(attn_md, "swa_pages", 0)
 
     # --- Dual-pointer path (both graph and eager): zero-copy, zero-alloc ---
     if compress_kv is not None and compress_kv.numel() > 0 and swa_pages > 0:
@@ -879,7 +879,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         )
     except Exception as e:
         rate_limited_log(
-            f"v4_fallback:graph_bind:L{self.layer_id}",
+            f"v4_error:graph_bind:L{self.layer_id}",
             logging.ERROR,
             "graph bind failed — layer %d: %s",
             self.layer_id,
@@ -1006,9 +1006,9 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         result = self.forward_impl(x, positions)
     except Exception as e:
         rate_limited_log(
-            f"v4_fallback:graph_fwd:L{self.layer_id}",
+            f"v4_error:graph_fwd:L{self.layer_id}",
             logging.ERROR,
-            "graph forward failed — layer %d (ratio=%d) output ZEROED (garbage): %s",
+            "graph forward failed — layer %d (ratio=%d): %s",
             self.layer_id,
             ratio,
             e,
@@ -1103,10 +1103,9 @@ def _patched_v4_forward(self, x, positions):
                     setattr(attn_md, _V4_META_BUILT_ATTR, True)
                     setattr(attn_md, _V4_META_FAILED_ATTR, True)
                     rate_limited_log(
-                        f"v4_fallback:eager_meta_triton:L{self.layer_id}",
+                        f"v4_error:eager_meta_triton:L{self.layer_id}",
                         logging.ERROR,
-                        "eager decode Triton metadata build returned False — "
-                        "layer %d output ZEROED (garbage)",
+                        "eager decode Triton metadata build returned False — layer %d",
                         self.layer_id,
                     )
                     return _raise_or_zero(
@@ -1128,10 +1127,9 @@ def _patched_v4_forward(self, x, positions):
                 )
         except Exception as e:
             rate_limited_log(
-                f"v4_fallback:eager_meta_build:L{self.layer_id}",
+                f"v4_error:eager_meta_build:L{self.layer_id}",
                 logging.ERROR,
-                "eager metadata construction failed — layer %d output ZEROED "
-                "(garbage): %s",
+                "eager metadata construction failed — layer %d: %s",
                 self.layer_id,
                 e,
                 exc_info_first=True,
@@ -1162,7 +1160,7 @@ def _patched_v4_forward(self, x, positions):
             )
         except Exception as e:
             rate_limited_log(
-                f"v4_fallback:eager_bind:L{self.layer_id}",
+                f"v4_error:eager_bind:L{self.layer_id}",
                 logging.ERROR,
                 "eager decode bind failed — layer %d: %s",
                 self.layer_id,
@@ -1253,10 +1251,9 @@ def _patched_v4_forward(self, x, positions):
             result = self.forward_impl(x, positions)
         except Exception as e:
             rate_limited_log(
-                f"v4_fallback:eager_fwd:L{self.layer_id}",
+                f"v4_error:eager_fwd:L{self.layer_id}",
                 logging.ERROR,
-                "eager decode forward failed — layer %d (ratio=%d) output "
-                "ZEROED (garbage): %s",
+                "eager decode forward failed — layer %d (ratio=%d): %s",
                 self.layer_id,
                 ratio,
                 e,
@@ -1303,10 +1300,9 @@ def _patched_v4_forward(self, x, positions):
             _bind_v4_layer_pools(self, cache_entry, ratio)
         except Exception as e:
             rate_limited_log(
-                f"v4_fallback:prefill_bind:L{self.layer_id}",
+                f"v4_error:prefill_bind:L{self.layer_id}",
                 logging.ERROR,
-                "prefill bind failed — layer %d falling back to dummy-run "
-                "forward (degraded output): %s",
+                "prefill bind failed — layer %d: %s",
                 self.layer_id,
                 e,
                 exc_info_first=True,
@@ -1566,9 +1562,9 @@ def _patched_v4_forward(self, x, positions):
         return result
     except Exception as e:
         rate_limited_log(
-            f"v4_fallback:prefill_fwd:L{self.layer_id}",
+            f"v4_error:prefill_fwd:L{self.layer_id}",
             logging.ERROR,
-            "prefill forward failed — layer %d (ratio=%d) output ZEROED (garbage): %s",
+            "prefill forward failed — layer %d (ratio=%d): %s",
             self.layer_id,
             ratio,
             e,

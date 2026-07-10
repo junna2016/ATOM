@@ -56,21 +56,16 @@ _REGION_TO_ENUM: Dict[int, Any] = {}
 def _resolve_region_ids() -> Dict[str, int]:
     try:
         from rtp_llm.ops.compute_ops import KVCacheRegionName
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         return dict(_FALLBACK_REGION_IDS)
     ids: Dict[str, int] = {}
     for name in _REGION_NAME_KEYS:
         member = getattr(KVCacheRegionName, name, None)
         if member is None:
-            # Member renamed/removed on the RTP side — a silent mismatch here
-            # would corrupt KV addressing, so warn and fall back for this one.
-            logger.warning(
-                "KVCacheRegionName has no member %s; using fallback id %d",
-                name,
-                _FALLBACK_REGION_IDS[name],
+            raise RuntimeError(
+                "RTP KVCacheRegionName is incompatible with the ATOM V4 bridge: "
+                f"missing required member {name}"
             )
-            ids[name] = _FALLBACK_REGION_IDS[name]
-            continue
         rid = int(member)
         ids[name] = rid
         _REGION_TO_ENUM[rid] = member
@@ -171,7 +166,7 @@ def get_pool_for_layer_region(
         return None
     try:
         return kv_cache.get_layer_cache(layer_id, region_enum)
-    except Exception:
+    except RuntimeError:
         # Expected control flow: a layer legitimately does not own every region
         # (e.g. dense layers own no CSA/HCA pool). Return None silently — this is
         # not an error, so do not log it.
@@ -203,9 +198,9 @@ def build_v4_kv_cache_tensors(
     region_to_group = build_region_to_group_map(kv_cache)
 
     if not region_to_group:
-        logger.warning(
-            "kv_cache has no group_region_names — falling back to single-pool mode. "
-            "V4 multi-region KV cache will not work correctly."
+        raise RuntimeError(
+            "V4 plugin requires kv_cache.group_region_names; single-pool fallback "
+            "cannot represent the required multi-region KV layout"
         )
 
     cache_data: Dict[str, KVCacheTensor] = {}
