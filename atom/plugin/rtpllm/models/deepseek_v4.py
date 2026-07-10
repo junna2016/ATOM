@@ -167,27 +167,12 @@ class _ATOMAttnPyObj:
     def fmha_params(self):
         return None
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:
-        """Build V4 decode metadata from live attn_inputs (OUTSIDE graph).
-
-        Computes indptrs, state_slot_mapping, n_committed on CPU and H2D
-        copies to pre-allocated GPU buffers. The captured graph's Triton
-        kernels will read from these stable addresses at replay time.
-        """
+    def _extract_graph_replay_metadata(self, attn_inputs, bufs):
+        """Build CPU replay metadata and resolve live region block tables."""
         rt = self._runtime
-        bufs = getattr(rt, "_cg_v4_bufs", None)
-        if bufs is None:
-            return  # Not prewarmed yet; graph capture hasn't happened
-
-        device = rt._model_device
-        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        if is_prefill:
-            return  # CUDA graph only captures decode path
-
-        # --- Extract batch info from live attn_inputs ---
         input_lengths = getattr(attn_inputs, "input_lengths", None)
         if input_lengths is None or input_lengths.numel() == 0:
-            return
+            return None
         bs = int(input_lengths.numel())
         max_bs = int(bufs["indptr_swa"].shape[0]) - 1
         if bs > max_bs:
@@ -195,20 +180,17 @@ class _ATOMAttnPyObj:
                 f"V4 graph replay batch size {bs} exceeds captured capacity {max_bs}"
             )
 
-        # Positions: sequence_lengths for decode (absolute position of new token)
         seq_lens = getattr(attn_inputs, "sequence_lengths", None)
         if seq_lens is not None and seq_lens.numel() >= bs:
             positions_np = seq_lens[:bs].detach().cpu().numpy().astype(np.int32)
         else:
             seq_lens_p1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
-            if seq_lens_p1 is not None and seq_lens_p1.numel() >= bs:
-                positions_np = (seq_lens_p1[:bs].detach().cpu().numpy() - 1).astype(
-                    np.int32
-                )
-            else:
+            if seq_lens_p1 is None or seq_lens_p1.numel() < bs:
                 raise ValueError("V4 graph replay requires sequence lengths")
+            positions_np = (seq_lens_p1[:bs].detach().cpu().numpy() - 1).astype(
+                np.int32
+            )
 
-        # Block tables (for state_slot_mapping = SWA block_table[:, 0])
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
             SWA_KV,
             HCA_KV,
@@ -219,246 +201,227 @@ class _ATOMAttnPyObj:
         region_to_group = build_region_to_group_map(rt.kv_cache)
         swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
         hca_bt = select_block_table_for_region(attn_inputs, HCA_KV, region_to_group)
-
-        # state_slot_mapping: use COMPACT indices [0..bs-1] for compressor state.
-        # The actual block IDs (block_table[:, 0]) are stored separately for
-        # swa_kv gather/scatter (remapping pool ↔ compact buffer).
-        if swa_bt is not None and swa_bt.numel() >= bs:
-            block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
-            block_ids_np = np.maximum(block_ids_np, 0)  # guard -1 (freed block)
-        else:
+        if swa_bt is None or swa_bt.numel() < bs:
             raise ValueError("V4 graph replay requires an SWA_KV block table")
-        # Compact slot mapping for compressor state: always [0, 1, ..., bs-1]
-        ssm_np = np.arange(bs, dtype=np.int32)
 
-        # batch_id_per_token: for decode, token t belongs to seq t
-        batch_id_np = np.full(max_bs, -1, dtype=np.int32)
-        batch_id_np[:bs] = np.arange(bs, dtype=np.int32)
+        block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
+        block_ids_np = np.maximum(block_ids_np, 0)
+        state_slots_np = np.arange(bs, dtype=np.int32)
+        batch_ids_np = np.full(max_bs, -1, dtype=np.int32)
+        batch_ids_np[:bs] = np.arange(bs, dtype=np.int32)
 
-        # n_committed
         win = int(bufs["_win"])
         index_topk = int(bufs["_index_topk"])
         n_csa_np = ((positions_np + 1) // DSV4_CSA_RATIO).astype(np.int32)
         n_hca_np = ((positions_np + 1) // DSV4_HCA_RATIO).astype(np.int32)
-
-        # --- Compute indptrs (ragged cumsums) ---
         actual_swa = np.minimum(positions_np + 1, win).astype(np.int32)
         csa_valid_k = np.minimum(
-            np.minimum((positions_np + 1) // DSV4_CSA_RATIO, n_csa_np), index_topk
+            np.minimum((positions_np + 1) // DSV4_CSA_RATIO, n_csa_np),
+            index_topk,
         ).astype(np.int32)
-        hca_valid = n_hca_np.astype(np.int32)
 
-        swa_indptr_np = np.zeros(max_bs + 1, dtype=np.int32)
-        csa_indptr_np = np.zeros(max_bs + 1, dtype=np.int32)
-        hca_indptr_np = np.zeros(max_bs + 1, dtype=np.int32)
-        if bs > 0:
-            swa_indptr_np[1 : bs + 1] = np.cumsum(actual_swa, dtype=np.int32)
-            csa_indptr_np[1 : bs + 1] = np.cumsum(
-                actual_swa + csa_valid_k, dtype=np.int32
-            )
-            hca_indptr_np[1 : bs + 1] = np.cumsum(
-                actual_swa + hca_valid, dtype=np.int32
-            )
-        # Pad tail with last value (sentinel: kv_len=0 for padded slots)
+        indptr_swa = np.zeros(max_bs + 1, dtype=np.int32)
+        indptr_csa = np.zeros(max_bs + 1, dtype=np.int32)
+        indptr_hca = np.zeros(max_bs + 1, dtype=np.int32)
+        indptr_swa[1 : bs + 1] = np.cumsum(actual_swa, dtype=np.int32)
+        indptr_csa[1 : bs + 1] = np.cumsum(actual_swa + csa_valid_k, dtype=np.int32)
+        indptr_hca[1 : bs + 1] = np.cumsum(actual_swa + n_hca_np, dtype=np.int32)
         if bs < max_bs:
-            swa_indptr_np[bs + 1 :] = swa_indptr_np[bs]
-            csa_indptr_np[bs + 1 :] = csa_indptr_np[bs]
-            hca_indptr_np[bs + 1 :] = hca_indptr_np[bs]
+            indptr_swa[bs + 1 :] = indptr_swa[bs]
+            indptr_csa[bs + 1 :] = indptr_csa[bs]
+            indptr_hca[bs + 1 :] = indptr_hca[bs]
 
-        # --- H2D copy to pre-allocated buffers ---
+        return {
+            "bs": bs,
+            "max_bs": max_bs,
+            "positions": positions_np,
+            "block_ids": block_ids_np,
+            "state_slots": state_slots_np,
+            "batch_ids": batch_ids_np,
+            "n_csa": n_csa_np,
+            "n_hca": n_hca_np,
+            "indptr_swa": indptr_swa,
+            "indptr_csa": indptr_csa,
+            "indptr_hca": indptr_hca,
+            "swa_bt": swa_bt,
+            "hca_bt": hca_bt,
+            "region_to_group": region_to_group,
+            "win": win,
+        }
+
+    def _seed_graph_replay_kv_state(
+        self,
+        attn_inputs,
+        bufs,
+        positions_np,
+        block_ids_np,
+        block_ids_buf,
+        swa_bt,
+        region_to_group,
+        bs,
+        win,
+    ) -> None:
+        """Seed compact SWA/compressor state for new graph replay slots.
+
+        Runs outside capture. Continuing requests retain their self-maintained
+        compact state; only slots with discontinuous positions are reseeded.
+        """
+        rt = self._runtime
+        current_bid_tuple = tuple(block_ids_np[:bs].tolist())
+        previous_positions = bufs.get("_prev_seed_positions")
+        current_positions = positions_np[:bs].tolist()
+        if previous_positions is None:
+            seed_mask = [True] * bs
+        else:
+            seed_mask = [
+                (i >= len(previous_positions)) or (pos != previous_positions[i] + 1)
+                for i, pos in enumerate(current_positions)
+            ]
+        bufs["_prev_seed_positions"] = current_positions
+        if not any(seed_mask):
+            return
+
+        bufs["_prev_gather_block_ids"] = current_bid_tuple
+        # Keep the device slice alive at the same point as before; graph forward
+        # consumes the owning fixed buffer through bufs["_block_ids"].
+        _ = block_ids_buf[:bs]
+        swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+
+        from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
+            CSA_STATE,
+            HCA_STATE,
+            select_block_table_for_region,
+        )
+
+        state_block_tables = {}
+        for state_region in (CSA_STATE, HCA_STATE):
+            state_bt = select_block_table_for_region(
+                attn_inputs, state_region, region_to_group
+            )
+            if state_bt is not None:
+                state_block_tables[state_region] = state_bt
+
+        try:
+            from atom.models.deepseek_v4 import DeepseekV4Attention
+
+            kv_cache_data = getattr(rt, "_rtp_kv_cache_data", None)
+            for module in rt.model.modules():
+                if not isinstance(module, DeepseekV4Attention):
+                    continue
+
+                compact_swa = getattr(module, "_compact_swa_kv", None)
+                pool_swa = getattr(module, "_rtp_pool_swa_kv", None)
+                if compact_swa is not None and pool_swa is not None:
+                    for slot in range(bs):
+                        if not seed_mask[slot]:
+                            continue
+                        position = int(positions_np[slot])
+                        ring_split = position % win
+                        current_col = position // win
+                        previous_col = current_col - 1 if current_col > 0 else 0
+                        current_block = int(
+                            swa_bt_cpu[slot, min(current_col, swa_bt_cpu.shape[1] - 1)]
+                        )
+                        current_block = max(current_block, 0)
+                        if current_col > 0 and previous_col < swa_bt_cpu.shape[1]:
+                            previous_block = int(
+                                swa_bt_cpu[
+                                    slot,
+                                    min(previous_col, swa_bt_cpu.shape[1] - 1),
+                                ]
+                            )
+                            previous_block = max(previous_block, 0)
+                            if ring_split > 0 and current_block < pool_swa.shape[0]:
+                                compact_swa[slot, :ring_split].copy_(
+                                    pool_swa[current_block, :ring_split]
+                                )
+                            if previous_block < pool_swa.shape[0]:
+                                compact_swa[slot, ring_split:].copy_(
+                                    pool_swa[previous_block, ring_split:]
+                                )
+                        elif current_block < pool_swa.shape[0]:
+                            compact_swa[slot].copy_(pool_swa[current_block])
+
+                compressor = getattr(module, "compressor", None)
+                ratio = getattr(module, "compress_ratio", 0)
+                if compressor is None or ratio == 0 or kv_cache_data is None:
+                    continue
+                state_region = CSA_STATE if ratio == DSV4_CSA_RATIO else HCA_STATE
+                state_bt = state_block_tables.get(state_region)
+                layer_id = getattr(module, "layer_id", -1)
+                cache_entry = kv_cache_data.get(f"layer_{layer_id}")
+                pool_name = "CSA_STATE" if ratio == DSV4_CSA_RATIO else "HCA_STATE"
+                state_pool = (
+                    cache_entry.k_cache.get(pool_name)
+                    if cache_entry and isinstance(cache_entry.k_cache, dict)
+                    else None
+                )
+                if state_bt is None or state_pool is None:
+                    continue
+                pool_raw = state_pool.kv_cache_base.view(torch.float32)
+                num_blocks = pool_raw.shape[0]
+                elems = pool_raw.numel() // num_blocks
+                pool_view = pool_raw.reshape(num_blocks, elems)
+                state_block_ids = state_bt[:bs, 0].to(torch.int64)
+                half = elems // 2
+                ring = compressor.kv_state.shape[1]
+                dim = compressor.kv_state.shape[2]
+                if half != ring * dim:
+                    continue
+                gathered = pool_view[state_block_ids]
+                kv_all = gathered[:, :half].reshape(bs, ring, dim)
+                score_all = gathered[:, half:].reshape(bs, ring, dim)
+                for slot in range(bs):
+                    if seed_mask[slot]:
+                        compressor.kv_state[slot] = kv_all[slot]
+                        compressor.score_state[slot] = score_all[slot]
+        except Exception as e:
+            raise RuntimeError("V4 SWA/STATE seed failed before graph replay") from e
+
+    def _copy_graph_replay_identity_buffers(self, bufs, replay, device):
+        """Copy position/slot identity before graph replay state seeding."""
+        bs = replay["bs"]
         bufs["positions"][:bs].copy_(
-            torch.from_numpy(positions_np).to(dtype=torch.int64), non_blocking=True
+            torch.from_numpy(replay["positions"]).to(dtype=torch.int64),
+            non_blocking=True,
         )
         bufs["state_slot"][:bs].copy_(
-            torch.from_numpy(ssm_np).to(dtype=torch.int32), non_blocking=True
+            torch.from_numpy(replay["state_slots"]).to(dtype=torch.int32),
+            non_blocking=True,
         )
-        # Store actual block IDs for swa_kv gather/scatter in graph mode
-        _block_ids_buf = bufs.get("_block_ids")
-        if _block_ids_buf is None:
-            _block_ids_buf = torch.zeros(
+        block_ids_buf = bufs.get("_block_ids")
+        if block_ids_buf is None:
+            block_ids_buf = torch.zeros(
                 int(bufs["state_slot"].shape[0]), device=device, dtype=torch.int64
             )
-            bufs["_block_ids"] = _block_ids_buf
-        _block_ids_buf[:bs].copy_(
-            torch.from_numpy(block_ids_np).to(dtype=torch.int64), non_blocking=True
+            bufs["_block_ids"] = block_ids_buf
+        block_ids_buf[:bs].copy_(
+            torch.from_numpy(replay["block_ids"]).to(dtype=torch.int64),
+            non_blocking=True,
         )
+        return block_ids_buf
 
-        # --- SWA gather: pool → compact (OUTSIDE graph, first step only) ---
-        # The compact SWA buffer is NOT populated by prefill (prefill writes to
-        # pool). We must gather pool[block_id] → compact ONCE at the start of
-        # each new request. Subsequent decode steps are self-maintaining via
-        # SWA write in forward_impl. Gathering every step would OVERWRITE the
-        # SWA writes from previous steps, so we only gather when block_ids change.
-        _prev_bids = bufs.get("_prev_gather_block_ids", None)
-        _curr_bid_tuple = tuple(block_ids_np[:bs].tolist())
-        # Seed the compact SWA ring / compressor state only at the FIRST decode
-        # step of each request. The compact ring is self-maintaining across decode
-        # steps via swa_write, so a mid-request re-seed is unnecessary — and
-        # harmful: the old guard re-seeded whenever the SWA block_table col0
-        # changed (i.e. at a window crossing, e.g. step 128), reading pool blocks
-        # [pos//win-1, pos//win] that decode never updated (per-step scatter
-        # targets col0), thereby overwriting the correct ring with stale prefill
-        # data and producing a garbage burst at the window boundary. This is the
-        # CUDA-graph-only precision bug (eager decode has no such re-seed).
-        #
-        # PER-SLOT seed decision. A slot is (re)seeded only if it is genuinely a
-        # new/restarted request: no prior entry (first step, or the batch grew
-        # into this slot), or its position is discontinuous vs the previous step
-        # (within a request positions increase by exactly 1 per step).
-        #
-        # This MUST be per-slot, not all-or-nothing: CUDA-graph decode pads the
-        # batch to a fixed captured size with inactive slots whose sentinel
-        # position is constant (e.g. 4094). A constant position is "discontinuous"
-        # every step, so an all-or-nothing guard re-seeds EVERY step whenever any
-        # padding slot is present, clobbering the self-maintained rings of the
-        # real active requests (the BS>1 garbage bug). Seeding a padding slot is
-        # harmless (its output is discarded); never re-seeding a continuing real
-        # slot preserves its ring. bufs is per-process (per TP rank).
-        _prev_pos = bufs.get("_prev_seed_positions")
-        _cur_pos = positions_np[:bs].tolist()
-        if _prev_pos is None:
-            _seed_mask = [True] * bs
-        else:
-            _seed_mask = [
-                (i >= len(_prev_pos)) or (c != _prev_pos[i] + 1)
-                for i, c in enumerate(_cur_pos)
-            ]
-        bufs["_prev_seed_positions"] = _cur_pos
-        _regather_ran = any(_seed_mask)
-        if _regather_ran:
-            bufs["_prev_gather_block_ids"] = _curr_bid_tuple
-            _bid_gpu = _block_ids_buf[:bs]
-            # Full block table for multi-block gather (prompts > win tokens)
-            swa_bt_cpu = (
-                swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
-                if swa_bt is not None
-                else None
-            )
-            # Also get STATE block tables for compressor state gather
-            _state_bts = {}
-            try:
-                from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
-                    CSA_STATE,
-                    HCA_STATE,
-                )
-
-                for _sr in (CSA_STATE, HCA_STATE):
-                    _sbt = select_block_table_for_region(
-                        attn_inputs, _sr, region_to_group
-                    )
-                    if _sbt is not None:
-                        _state_bts[_sr] = _sbt
-            except Exception as e:
-                raise RuntimeError("failed to resolve V4 STATE block tables") from e
-            try:
-                from atom.models.deepseek_v4 import DeepseekV4Attention
-
-                kv_cache_data = getattr(rt, "_rtp_kv_cache_data", None)
-                for module in rt.model.modules():
-                    if not isinstance(module, DeepseekV4Attention):
-                        continue
-                    # SWA gather: pool → compact swa_kv
-                    # For prompts > win tokens, SWA data spans multiple blocks.
-                    # We must gather the correct ring positions from each block:
-                    #   ring [0, split): from current block (latest positions)
-                    #   ring [split, win): from previous block
-                    _compact = getattr(module, "_compact_swa_kv", None)
-                    _pool = getattr(module, "_rtp_pool_swa_kv", None)
-                    if _compact is not None and _pool is not None:
-                        for _si in range(bs):
-                            if not _seed_mask[_si]:
-                                continue
-                            _pos = int(positions_np[_si])
-                            _ring_split = _pos % win
-                            _cur_col = _pos // win
-                            _prev_col = _cur_col - 1 if _cur_col > 0 else 0
-                            _cur_bid_val = int(
-                                swa_bt_cpu[_si, min(_cur_col, swa_bt_cpu.shape[1] - 1)]
-                            )
-                            _cur_bid_val = max(_cur_bid_val, 0)
-                            if _cur_col > 0 and _prev_col < swa_bt_cpu.shape[1]:
-                                _prev_bid_val = int(
-                                    swa_bt_cpu[
-                                        _si, min(_prev_col, swa_bt_cpu.shape[1] - 1)
-                                    ]
-                                )
-                                _prev_bid_val = max(_prev_bid_val, 0)
-                                # Split gather: ring [0, split) from current, [split, win) from previous
-                                if _ring_split > 0 and _cur_bid_val < _pool.shape[0]:
-                                    _compact[_si, :_ring_split].copy_(
-                                        _pool[_cur_bid_val, :_ring_split]
-                                    )
-                                if _prev_bid_val < _pool.shape[0]:
-                                    _compact[_si, _ring_split:].copy_(
-                                        _pool[_prev_bid_val, _ring_split:]
-                                    )
-                            else:
-                                # Single block: copy entire block
-                                if _cur_bid_val < _pool.shape[0]:
-                                    _compact[_si].copy_(_pool[_cur_bid_val])
-
-                    # STATE gather: pool → compact kv_state/score_state
-                    _comp = getattr(module, "compressor", None)
-                    _ratio = getattr(module, "compress_ratio", 0)
-                    if _comp is not None and _ratio != 0 and kv_cache_data is not None:
-                        _sr = CSA_STATE if _ratio == DSV4_CSA_RATIO else HCA_STATE
-                        _sbt = _state_bts.get(_sr)
-                        _layer_id = getattr(module, "layer_id", -1)
-                        _ce = kv_cache_data.get(f"layer_{_layer_id}")
-                        _sp_name = (
-                            "CSA_STATE" if _ratio == DSV4_CSA_RATIO else "HCA_STATE"
-                        )
-                        _sp = (
-                            _ce.k_cache.get(_sp_name)
-                            if _ce and isinstance(_ce.k_cache, dict)
-                            else None
-                        )
-                        if _sbt is not None and _sp is not None:
-                            _sp_raw = _sp.kv_cache_base.view(torch.float32)
-                            _n_blk = _sp_raw.shape[0]
-                            _elems = _sp_raw.numel() // _n_blk
-                            _sp_view = _sp_raw.reshape(_n_blk, _elems)
-                            _s_bids = _sbt[:bs, 0].to(torch.int64)
-                            _half = _elems // 2
-                            _ring = _comp.kv_state.shape[1]
-                            _dim = _comp.kv_state.shape[2]
-                            if _half == _ring * _dim:
-                                _gathered = _sp_view[_s_bids]
-                                _kv_all = _gathered[:, :_half].reshape(bs, _ring, _dim)
-                                _sc_all = _gathered[:, _half:].reshape(bs, _ring, _dim)
-                                # Per-slot: only overwrite state for slots being
-                                # (re)seeded; continuing real requests keep their
-                                # self-maintained state.
-                                for _si in range(bs):
-                                    if not _seed_mask[_si]:
-                                        continue
-                                    _comp.kv_state[_si] = _kv_all[_si]
-                                    _comp.score_state[_si] = _sc_all[_si]
-            except Exception as e:
-                raise RuntimeError(
-                    "V4 SWA/STATE seed failed before graph replay"
-                ) from e
-
+    @staticmethod
+    def _copy_graph_replay_attention_buffers(bufs, replay) -> None:
+        """Copy ragged attention metadata after SWA/STATE seeding."""
+        bs = replay["bs"]
+        max_bs = replay["max_bs"]
         bufs["batch_id"][:max_bs].copy_(
-            torch.from_numpy(batch_id_np).to(dtype=torch.int32), non_blocking=True
+            torch.from_numpy(replay["batch_ids"]).to(dtype=torch.int32),
+            non_blocking=True,
         )
-        bufs["n_csa"][:bs].copy_(
-            torch.from_numpy(n_csa_np).to(dtype=torch.int32), non_blocking=True
-        )
-        bufs["n_hca"][:bs].copy_(
-            torch.from_numpy(n_hca_np).to(dtype=torch.int32), non_blocking=True
-        )
-        bufs["indptr_swa"][: max_bs + 1].copy_(
-            torch.from_numpy(swa_indptr_np).to(dtype=torch.int32), non_blocking=True
-        )
-        bufs["indptr_csa"][: max_bs + 1].copy_(
-            torch.from_numpy(csa_indptr_np).to(dtype=torch.int32), non_blocking=True
-        )
-        bufs["indptr_hca"][: max_bs + 1].copy_(
-            torch.from_numpy(hca_indptr_np).to(dtype=torch.int32), non_blocking=True
-        )
+        for key in ("n_csa", "n_hca"):
+            bufs[key][:bs].copy_(
+                torch.from_numpy(replay[key]).to(dtype=torch.int32),
+                non_blocking=True,
+            )
+        for key in ("indptr_swa", "indptr_csa", "indptr_hca"):
+            bufs[key][: max_bs + 1].copy_(
+                torch.from_numpy(replay[key]).to(dtype=torch.int32),
+                non_blocking=True,
+            )
 
-        # HCA block_tables for write_v4_decode_hca_compress_tail kernel
+        hca_bt = replay["hca_bt"]
         if hca_bt is not None and hca_bt.numel() >= bs:
             bt_gpu = bufs["block_tables_hca"]
             cols = min(int(hca_bt.shape[1]), int(bt_gpu.shape[1]))
@@ -466,34 +429,58 @@ class _ATOMAttnPyObj:
                 hca_bt[:bs, :cols].to(torch.int32), non_blocking=True
             )
 
-        # --- Build compress_plans using CpuGpuBuffer plan buffers ---
-        # make_compress_plans runs on CPU numpy + H2D via CpuGpuBuffer.copy_to_gpu().
-        # The returned CompressPlan objects reference the stable GPU buffers,
-        # so forward_impl inside the captured graph reads from stable addresses.
+    @staticmethod
+    def _update_graph_replay_compress_plans(bufs, replay) -> None:
+        """Refresh graph-stable compression plans for the live decode step."""
         plan_buffers = bufs.get("_plan_buffers")
-        decode_cap = bufs.get("_decode_compress_cap")
-        if plan_buffers is not None:
-            from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
+        if plan_buffers is None:
+            return
+        from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
 
-            extend_lens_cpu = np.ones(bs, dtype=np.int32)
-            context_lens_cpu = (positions_np + 1).astype(np.int32)
-            compress_plans = make_compress_plans(
-                extend_lens_cpu,
-                context_lens_cpu,
-                DSV4_COMPRESS_RATIOS_WITH_OVERLAP,
-                plan_buffers=plan_buffers,
-                decode_capacity_per_ratio=decode_cap,
-            )
-            bufs["_compress_plans"] = compress_plans
+        bs = replay["bs"]
+        extend_lens_cpu = np.ones(bs, dtype=np.int32)
+        context_lens_cpu = (replay["positions"] + 1).astype(np.int32)
+        bufs["_compress_plans"] = make_compress_plans(
+            extend_lens_cpu,
+            context_lens_cpu,
+            DSV4_COMPRESS_RATIOS_WITH_OVERLAP,
+            plan_buffers=plan_buffers,
+            decode_capacity_per_ratio=bufs.get("_decode_compress_cap"),
+        )
 
-        # Store state_slot_mapping_cpu (numpy) for compressor internals
-        bufs["_state_slot_mapping_cpu"] = ssm_np[:bs].copy()
+    def prepare_cuda_graph(self, attn_inputs) -> None:
+        """Build V4 decode metadata from live attn_inputs (OUTSIDE graph).
 
-        # Stash active batch size for the graph-mode forward path
-        bufs["_active_bs"] = bs
-
-        # NOTE: Do NOT reset compressor state here. Prefill already handles
-        # state initialization via _reset_v4_state_all().
+        Computes indptrs, state_slot_mapping, n_committed on CPU and H2D
+        copies to pre-allocated GPU buffers. The captured graph's Triton
+        kernels will read from these stable addresses at replay time.
+        """
+        bufs = getattr(self._runtime, "_cg_v4_bufs", None)
+        if bufs is None:
+            return  # Not prewarmed yet; graph capture hasn't happened
+        if bool(getattr(attn_inputs, "is_prefill", False)):
+            return  # CUDA graph only captures decode path
+        replay = self._extract_graph_replay_metadata(attn_inputs, bufs)
+        if replay is None:
+            return
+        block_ids_buf = self._copy_graph_replay_identity_buffers(
+            bufs, replay, self._runtime._model_device
+        )
+        self._seed_graph_replay_kv_state(
+            attn_inputs,
+            bufs,
+            replay["positions"],
+            replay["block_ids"],
+            block_ids_buf,
+            replay["swa_bt"],
+            replay["region_to_group"],
+            replay["bs"],
+            replay["win"],
+        )
+        self._copy_graph_replay_attention_buffers(bufs, replay)
+        self._update_graph_replay_compress_plans(bufs, replay)
+        bufs["_state_slot_mapping_cpu"] = replay["state_slots"].copy()
+        bufs["_active_bs"] = replay["bs"]
 
 
 class _ATOMDeepSeekV4Runtime(GptModelBase):
