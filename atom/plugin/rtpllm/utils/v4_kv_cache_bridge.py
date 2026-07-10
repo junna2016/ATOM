@@ -15,6 +15,10 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
+    DSV4_CSA_RATIO,
+    DSV4_HCA_RATIO,
+)
 from atom.config import KVCacheTensor
 
 logger = logging.getLogger("atom.plugin.rtpllm.utils.v4_kv_cache_bridge")
@@ -210,9 +214,9 @@ def build_v4_kv_cache_tensors(
         layer_pools: Dict[str, Any] = {}
 
         # Determine which regions this layer uses
-        if ratio == 4:
+        if ratio == DSV4_CSA_RATIO:
             needed_regions = _CSA_REGIONS
-        elif ratio == 128:
+        elif ratio == DSV4_HCA_RATIO:
             needed_regions = _HCA_REGIONS
         else:
             needed_regions = _DENSE_REGIONS
@@ -273,9 +277,11 @@ def _selfcheck_v4_pools(
         return
     _SELFCHECK_DONE = True
     try:
-        n_csa = sum(1 for r in compress_ratios if r == 4)
-        n_hca = sum(1 for r in compress_ratios if r == 128)
-        n_dense = sum(1 for r in compress_ratios if r not in (4, 128))
+        n_csa = sum(1 for r in compress_ratios if r == DSV4_CSA_RATIO)
+        n_hca = sum(1 for r in compress_ratios if r == DSV4_HCA_RATIO)
+        n_dense = sum(
+            1 for r in compress_ratios if r not in (DSV4_CSA_RATIO, DSV4_HCA_RATIO)
+        )
 
         # region_name -> {expect, have, geom, missing_layers}
         agg: Dict[str, Dict[str, Any]] = {}
@@ -285,9 +291,9 @@ def _selfcheck_v4_pools(
         # separately instead of flagging every region as MISSING (false alarm).
         no_pool_layers = []
         for layer_id, ratio in enumerate(compress_ratios):
-            if ratio == 4:
+            if ratio == DSV4_CSA_RATIO:
                 expected = _CSA_REGIONS
-            elif ratio == 128:
+            elif ratio == DSV4_HCA_RATIO:
                 expected = _HCA_REGIONS
             else:
                 expected = _DENSE_REGIONS

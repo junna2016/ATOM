@@ -36,6 +36,16 @@ from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
 from atom.model_loader.loader import WeightsMapper
+from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
+    DSV4_CSA_RATIO,
+    DSV4_HCA_RATIO,
+    DSV4_DEFAULT_WINDOW_SIZE,
+    DSV4_DEFAULT_INDEX_TOPK,
+    DSV4_COMPRESS_PLAN_WIDTH,
+    DSV4_CSA_DECODE_WRITE_TOKENS,
+    DSV4_HCA_DECODE_WRITE_TOKENS,
+    DSV4_COMPRESS_RATIOS_WITH_OVERLAP,
+)
 
 logger = logging.getLogger("atom.plugin.rtpllm.models.deepseek_v4")
 
@@ -181,7 +191,9 @@ class _ATOMAttnPyObj:
         bs = int(input_lengths.numel())
         max_bs = int(bufs["indptr_swa"].shape[0]) - 1
         if bs > max_bs:
-            bs = max_bs
+            raise ValueError(
+                f"V4 graph replay batch size {bs} exceeds captured capacity {max_bs}"
+            )
 
         # Positions: sequence_lengths for decode (absolute position of new token)
         seq_lens = getattr(attn_inputs, "sequence_lengths", None)
@@ -194,7 +206,7 @@ class _ATOMAttnPyObj:
                     np.int32
                 )
             else:
-                positions_np = np.zeros(bs, dtype=np.int32)
+                raise ValueError("V4 graph replay requires sequence lengths")
 
         # Block tables (for state_slot_mapping = SWA block_table[:, 0])
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
@@ -215,7 +227,7 @@ class _ATOMAttnPyObj:
             block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
             block_ids_np = np.maximum(block_ids_np, 0)  # guard -1 (freed block)
         else:
-            block_ids_np = np.arange(bs, dtype=np.int32)
+            raise ValueError("V4 graph replay requires an SWA_KV block table")
         # Compact slot mapping for compressor state: always [0, 1, ..., bs-1]
         ssm_np = np.arange(bs, dtype=np.int32)
 
@@ -226,13 +238,13 @@ class _ATOMAttnPyObj:
         # n_committed
         win = int(bufs["_win"])
         index_topk = int(bufs["_index_topk"])
-        n_csa_np = ((positions_np + 1) // 4).astype(np.int32)
-        n_hca_np = ((positions_np + 1) // 128).astype(np.int32)
+        n_csa_np = ((positions_np + 1) // DSV4_CSA_RATIO).astype(np.int32)
+        n_hca_np = ((positions_np + 1) // DSV4_HCA_RATIO).astype(np.int32)
 
         # --- Compute indptrs (ragged cumsums) ---
         actual_swa = np.minimum(positions_np + 1, win).astype(np.int32)
         csa_valid_k = np.minimum(
-            np.minimum((positions_np + 1) // 4, n_csa_np), index_topk
+            np.minimum((positions_np + 1) // DSV4_CSA_RATIO, n_csa_np), index_topk
         ).astype(np.int32)
         hca_valid = n_hca_np.astype(np.int32)
 
@@ -336,8 +348,8 @@ class _ATOMAttnPyObj:
                     )
                     if _sbt is not None:
                         _state_bts[_sr] = _sbt
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError("failed to resolve V4 STATE block tables") from e
             try:
                 from atom.models.deepseek_v4 import DeepseekV4Attention
 
@@ -389,11 +401,13 @@ class _ATOMAttnPyObj:
                     _comp = getattr(module, "compressor", None)
                     _ratio = getattr(module, "compress_ratio", 0)
                     if _comp is not None and _ratio != 0 and kv_cache_data is not None:
-                        _sr = CSA_STATE if _ratio == 4 else HCA_STATE
+                        _sr = CSA_STATE if _ratio == DSV4_CSA_RATIO else HCA_STATE
                         _sbt = _state_bts.get(_sr)
                         _layer_id = getattr(module, "layer_id", -1)
                         _ce = kv_cache_data.get(f"layer_{_layer_id}")
-                        _sp_name = "CSA_STATE" if _ratio == 4 else "HCA_STATE"
+                        _sp_name = (
+                            "CSA_STATE" if _ratio == DSV4_CSA_RATIO else "HCA_STATE"
+                        )
                         _sp = (
                             _ce.k_cache.get(_sp_name)
                             if _ce and isinstance(_ce.k_cache, dict)
@@ -421,7 +435,9 @@ class _ATOMAttnPyObj:
                                     _comp.kv_state[_si] = _kv_all[_si]
                                     _comp.score_state[_si] = _sc_all[_si]
             except Exception as e:
-                logger.warning("SWA/STATE gather failed: %s", e)
+                raise RuntimeError(
+                    "V4 SWA/STATE seed failed before graph replay"
+                ) from e
 
         bufs["batch_id"][:max_bs].copy_(
             torch.from_numpy(batch_id_np).to(dtype=torch.int32), non_blocking=True
@@ -464,7 +480,7 @@ class _ATOMAttnPyObj:
             compress_plans = make_compress_plans(
                 extend_lens_cpu,
                 context_lens_cpu,
-                [(4, True), (128, False)],
+                DSV4_COMPRESS_RATIOS_WITH_OVERLAP,
                 plan_buffers=plan_buffers,
                 decode_capacity_per_ratio=decode_cap,
             )
@@ -618,10 +634,18 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         args = getattr(model, "args", None) or getattr(
             getattr(model, "model", None), "args", None
         )
-        win = int(getattr(args, "window_size", 128)) if args else 128
-        index_topk = int(getattr(args, "index_topk", 1024)) if args else 1024
+        win = (
+            int(getattr(args, "window_size", DSV4_DEFAULT_WINDOW_SIZE))
+            if args
+            else DSV4_DEFAULT_WINDOW_SIZE
+        )
+        index_topk = (
+            int(getattr(args, "index_topk", DSV4_DEFAULT_INDEX_TOPK))
+            if args
+            else DSV4_DEFAULT_INDEX_TOPK
+        )
         # max_committed_hca = worst case per-seq HCA entries
-        max_committed_hca = max(1, max_seq_len // 128)
+        max_committed_hca = max(1, max_seq_len // DSV4_HCA_RATIO)
 
         from atom.utils import CpuGpuBuffer
 
@@ -652,24 +676,39 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             # compress: at most bs compression boundaries per decode step
             # write: at most bs * K tokens in write window
             "_plan_buffers": {
-                4: {
+                DSV4_CSA_RATIO: {
                     "compress": CpuGpuBuffer(
-                        max(1, max_bs), 4, dtype=torch.int32, device=device
+                        max(1, max_bs),
+                        DSV4_COMPRESS_PLAN_WIDTH,
+                        dtype=torch.int32,
+                        device=device,
                     ),
                     "write": CpuGpuBuffer(
-                        max(1, max_bs * 8), 4, dtype=torch.int32, device=device
+                        max(1, max_bs * DSV4_CSA_DECODE_WRITE_TOKENS),
+                        DSV4_COMPRESS_PLAN_WIDTH,
+                        dtype=torch.int32,
+                        device=device,
                     ),
                 },
-                128: {
+                DSV4_HCA_RATIO: {
                     "compress": CpuGpuBuffer(
-                        max(1, max_bs), 4, dtype=torch.int32, device=device
+                        max(1, max_bs),
+                        DSV4_COMPRESS_PLAN_WIDTH,
+                        dtype=torch.int32,
+                        device=device,
                     ),
                     "write": CpuGpuBuffer(
-                        max(1, max_bs * 128), 4, dtype=torch.int32, device=device
+                        max(1, max_bs * DSV4_HCA_DECODE_WRITE_TOKENS),
+                        DSV4_COMPRESS_PLAN_WIDTH,
+                        dtype=torch.int32,
+                        device=device,
                     ),
                 },
             },
-            "_decode_compress_cap": {4: max(1, max_bs), 128: max(1, max_bs)},
+            "_decode_compress_cap": {
+                DSV4_CSA_RATIO: max(1, max_bs),
+                DSV4_HCA_RATIO: max(1, max_bs),
+            },
             # Config constants (stored for prepare_cuda_graph to read)
             "_win": win,
             "_index_topk": index_topk,
@@ -689,14 +728,15 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         self._cg_v4_bufs["_compress_plans"] = make_compress_plans(
             empty_extend,
             empty_context,
-            [(4, True), (128, False)],
+            DSV4_COMPRESS_RATIOS_WITH_OVERLAP,
             plan_buffers=self._cg_v4_bufs["_plan_buffers"],
             decode_capacity_per_ratio=self._cg_v4_bufs["_decode_compress_cap"],
         )
         self._cg_v4_bufs["_state_slot_mapping_cpu"] = np.zeros(1, dtype=np.int32)
 
-        # Initialize module-level pool view caches for graph-capture fallback
-        # (there is NO eager forward before graph capture in RTP-LLM).
+        # Initialize runtime-scoped pool views for graph-capture fallback. There
+        # is no eager forward before capture, and process globals would retain
+        # stale device pointers across model/KV-cache reloads.
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
             SWA_KV,
             CSA_KV,
@@ -716,10 +756,12 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                     list(getattr(_args, "compress_ratios", ())) if _args else []
                 )
             csa_layer_id = next(
-                (i for i, r in enumerate(compress_ratios) if r == 4), None
+                (i for i, r in enumerate(compress_ratios) if r == DSV4_CSA_RATIO),
+                None,
             )
             hca_layer_id = next(
-                (i for i, r in enumerate(compress_ratios) if r == 128), None
+                (i for i, r in enumerate(compress_ratios) if r == DSV4_HCA_RATIO),
+                None,
             )
             csa_pool = (
                 get_pool_for_layer_region(kv_cache, csa_layer_id, CSA_KV)
@@ -733,21 +775,19 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             )
             head_dim = int(getattr(args, "v_head_dim", 512)) if args else 512
 
-            import atom.plugin.rtpllm.attention_backend.rtp_dsv4_attention as _v4_attn
-
+            pool_views = {}
             if swa_pool is not None:
                 _swa_raw = swa_pool.kv_cache_base
-                _v4_attn._SWA_FLAT_CACHE = _swa_raw.view(torch.bfloat16).reshape(
+                pool_views["swa"] = _swa_raw.view(torch.bfloat16).reshape(-1, head_dim)
+            if csa_pool is not None:
+                pool_views["csa"] = csa_pool.kv_cache_base.view(torch.bfloat16).reshape(
                     -1, head_dim
                 )
-            if csa_pool is not None:
-                _v4_attn._CSA_COMPRESS_KV_CACHE = csa_pool.kv_cache_base.view(
-                    torch.bfloat16
-                ).reshape(-1, head_dim)
             if hca_pool is not None:
-                _v4_attn._HCA_COMPRESS_KV_CACHE = hca_pool.kv_cache_base.view(
-                    torch.bfloat16
-                ).reshape(-1, head_dim)
+                pool_views["hca"] = hca_pool.kv_cache_base.view(torch.bfloat16).reshape(
+                    -1, head_dim
+                )
+            self._cg_v4_bufs["_pool_views"] = pool_views
             logger.info("Initialized pool view caches for graph capture fallback")
         except Exception as e:
             logger.warning("Failed to initialize pool view caches: %s", e)
@@ -830,7 +870,11 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         # Profiler trigger check (model-level, called once per forward)
         global _plugin_profiler, _plugin_profile_dir
         input_ids = getattr(inputs, "input_ids", None)
-        if os.environ.get("ATOM_PLUGIN_PROFILE") == "1" and input_ids is not None and input_ids.numel() > 0:
+        if (
+            os.environ.get("ATOM_PLUGIN_PROFILE") == "1"
+            and input_ids is not None
+            and input_ids.numel() > 0
+        ):
             _profile_dir = _plugin_profile_dir or os.environ.get(
                 "ATOM_PLUGIN_PROFILE_DIR", "./plugin_traces"
             )
@@ -861,10 +905,13 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
 
         input_ids = getattr(inputs, "input_ids", None)
-        if input_ids is not None and input_ids.numel() > 0:
-            input_ids = input_ids.to(device=model_device, non_blocking=True)
+        if input_ids is None or input_ids.numel() == 0:
+            raise ValueError("ATOM V4 forward requires non-empty input_ids")
+        input_ids = input_ids.to(device=model_device, non_blocking=True)
 
         attn_inputs = getattr(inputs, "attention_inputs", None)
+        if attn_inputs is None:
+            raise ValueError("ATOM V4 forward requires attention_inputs")
         positions = getattr(attn_inputs, "position_ids", None) if attn_inputs else None
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
@@ -884,9 +931,8 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
                         device=model_device, dtype=torch.int32, non_blocking=True
                     ).contiguous()
                 else:
-                    num_tokens = input_ids.numel() if input_ids is not None else 1
-                    positions = torch.zeros(
-                        num_tokens, dtype=torch.int32, device=model_device
+                    raise ValueError(
+                        "ATOM V4 decode requires position_ids or sequence_lengths"
                     )
             else:
                 # Prefill: construct per-sequence positions [0,..,L1-1, 0,..,L2-1, ...]

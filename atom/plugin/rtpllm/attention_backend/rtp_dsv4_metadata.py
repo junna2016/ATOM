@@ -19,8 +19,16 @@ from atom.plugin.rtpllm.attention_backend.rtp_dsv4_constants import (
     _V4_META_BUILT_ATTR,
     _V4_META_FAILED_ATTR,
 )
+from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
+    DSV4_DEFAULT_WINDOW_SIZE,
+    DSV4_DEFAULT_INDEX_TOPK,
+    DSV4_CSA_RATIO,
+    DSV4_HCA_RATIO,
+    DSV4_COMPRESS_PLAN_WIDTH,
+)
 
 logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.rtp_dsv4_metadata")
+
 
 def _build_eager_decode_with_triton(
     attn_md,
@@ -29,9 +37,9 @@ def _build_eager_decode_with_triton(
     v4_block_tables,
     region_to_group,
     device,
-    window_size=128,
+    window_size=DSV4_DEFAULT_WINDOW_SIZE,
     pool_swa_pages=0,
-    index_topk=1024,
+    index_topk=DSV4_DEFAULT_INDEX_TOPK,
 ):
     """Build eager decode metadata using Triton kernels (same as CUDA Graph mode).
 
@@ -86,13 +94,13 @@ def _build_eager_decode_with_triton(
         block_ids_np = block_ids_raw_np
 
     # --- n_committed ---
-    n_csa_np = ((positions_np + 1) // 4).astype(np.int32)
-    n_hca_np = ((positions_np + 1) // 128).astype(np.int32)
+    n_csa_np = ((positions_np + 1) // DSV4_CSA_RATIO).astype(np.int32)
+    n_hca_np = ((positions_np + 1) // DSV4_HCA_RATIO).astype(np.int32)
 
     # --- Compute indptrs (ragged cumsums) ---
     actual_swa = np.minimum(positions_np + 1, win).astype(np.int32)
     csa_valid_k = np.minimum(
-        np.minimum((positions_np + 1) // 4, n_csa_np), index_topk
+        np.minimum((positions_np + 1) // DSV4_CSA_RATIO, n_csa_np), index_topk
     ).astype(np.int32)
     hca_valid = n_hca_np.astype(np.int32)
 
@@ -196,27 +204,39 @@ def _build_eager_decode_with_triton(
         extend_lens_cpu = np.ones(bs, dtype=np.int32)
         context_lens_cpu = (positions_np + 1).astype(np.int32)
         _plan_bufs = {
-            4: {
+            DSV4_CSA_RATIO: {
                 "compress": CpuGpuBuffer(
-                    max(1, bs), 4, dtype=torch.int32, device=device
+                    max(1, bs),
+                    DSV4_COMPRESS_PLAN_WIDTH,
+                    dtype=torch.int32,
+                    device=device,
                 ),
                 "write": CpuGpuBuffer(
-                    max(1, bs * 8), 4, dtype=torch.int32, device=device
+                    max(1, bs * 2 * DSV4_CSA_RATIO),
+                    DSV4_COMPRESS_PLAN_WIDTH,
+                    dtype=torch.int32,
+                    device=device,
                 ),
             },
-            128: {
+            DSV4_HCA_RATIO: {
                 "compress": CpuGpuBuffer(
-                    max(1, bs), 4, dtype=torch.int32, device=device
+                    max(1, bs),
+                    DSV4_COMPRESS_PLAN_WIDTH,
+                    dtype=torch.int32,
+                    device=device,
                 ),
                 "write": CpuGpuBuffer(
-                    max(1, bs * 128), 4, dtype=torch.int32, device=device
+                    max(1, bs * DSV4_HCA_RATIO),
+                    DSV4_COMPRESS_PLAN_WIDTH,
+                    dtype=torch.int32,
+                    device=device,
                 ),
             },
         }
         attn_md.compress_plans = make_compress_plans(
             extend_lens_cpu,
             context_lens_cpu,
-            [(4, True), (128, False)],
+            [(DSV4_CSA_RATIO, True), (DSV4_HCA_RATIO, False)],
             plan_buffers=_plan_bufs,
         )
     except Exception as e:
@@ -236,9 +256,9 @@ def _build_eager_decode_with_triton(
     # rows are seeded by the one-shot multi-block split seed in the eager forward
     # instead. (block_ids_raw_np < 0 = freed col0; the pool clamps -1 to block 0,
     # syncing which would corrupt the ring / pollute block 0 in a bs>1 batch.)
-    _valid_rows_np = np.nonzero(
-        (block_ids_raw_np >= 0) & (positions_np[:bs] < win)
-    )[0].astype(np.int64)
+    _valid_rows_np = np.nonzero((block_ids_raw_np >= 0) & (positions_np[:bs] < win))[
+        0
+    ].astype(np.int64)
     attn_md._eager_swa_gather_rows = torch.from_numpy(_valid_rows_np).to(device=device)
     attn_md._eager_triton_swa_pages = swa_pages_val
     attn_md._eager_triton_positions = positions_gpu
@@ -248,9 +268,7 @@ def _build_eager_decode_with_triton(
     # col0-only gather above skips. Without this a long-prompt slot's compact ring
     # is never seeded and serves stale / cross-request data (bs>1 contamination).
     if swa_bt is not None and swa_bt.numel() >= bs:
-        attn_md._eager_swa_bt_cpu = (
-            swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
-        )
+        attn_md._eager_swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
     else:
         attn_md._eager_swa_bt_cpu = None
     attn_md._eager_swa_positions_cpu = positions_np[:bs].copy()
@@ -287,7 +305,7 @@ def _build_hca_prefix_indices_gpu(
     positions, bid_per_tok, hca_bt, swa_pages, hca_k, total_tokens, device
 ):
     """Build HCA prefix indices on GPU."""
-    n_hca_per_tok = ((positions + 1) // 128).to(torch.int32)
+    n_hca_per_tok = ((positions + 1) // DSV4_HCA_RATIO).to(torch.int32)
     indptr = torch.zeros(total_tokens + 1, dtype=torch.int32, device=device)
     torch.cumsum(n_hca_per_tok, dim=0, out=indptr[1:])
     total_nnz = int(indptr[-1].item())
@@ -319,7 +337,7 @@ def _build_csa_prefix_indices_gpu(
 ):
     """Build CSA prefix indices on GPU (zeros with computed indptr)."""
     n_csa_per_tok = torch.minimum(
-        (positions + 1) // 4,
+        (positions + 1) // DSV4_CSA_RATIO,
         torch.minimum(
             n_csa_per_seq[bid_per_tok.long()].to(torch.int32),
             torch.tensor(index_topk, dtype=torch.int32, device=device),
@@ -339,7 +357,7 @@ def _build_v4_per_forward_metadata(
     v4_block_tables,
     region_to_group,
     device,
-    window_size=128,
+    window_size=DSV4_DEFAULT_WINDOW_SIZE,
     pool_swa_pages=0,
 ):
     """Construct V4-specific attention metadata from RTP-LLM inputs.
@@ -461,13 +479,10 @@ def _build_v4_per_forward_metadata(
             seq_lens_cpu=seq_lens_cpu,
         )
     except Exception as e:
-        logger.warning(
-            "Failed to build compress_plans: %s — attention will use fallback", e
-        )
-        attn_md.compress_plans = {}
+        raise RuntimeError("failed to build V4 compression plans") from e
 
     unique_ratios = set(r for r in v4_ratios if r > 0)
-    csa_ratio = 4  # V4 CSA always uses ratio=4
+    csa_ratio = DSV4_CSA_RATIO
     for ratio_val in unique_ratios:
         committed = seq_lens_cpu // ratio_val
         key = f"n_committed_{_ratio_label(ratio_val)}_per_seq"
@@ -561,7 +576,7 @@ def _build_v4_per_forward_metadata(
         attn_md.kv_indptr_swa = ptr_swa
 
         # HCA buffer: SWA-only for isolation test (disable compress entries)
-        hca_k = win // 128  # k_per_block for HCA = block_size / ratio = 128/128 = 1
+        hca_k = win // DSV4_HCA_RATIO
         hca_bt = v4_block_tables.get(HCA_KV)
         hca_bt_cpu = hca_bt.cpu().numpy() if hca_bt is not None else None
         hca_all = []
@@ -569,7 +584,7 @@ def _build_v4_per_forward_metadata(
         for t in range(total_tokens):
             bid = int(bid_per_tok[t])
             pos = int(positions_np[t])
-            n_committed = (pos + 1) // 128
+            n_committed = (pos + 1) // DSV4_HCA_RATIO
             if hca_bt_cpu is not None and n_committed > 0:
                 for ci in range(n_committed):
                     lb = ci // hca_k
@@ -592,15 +607,21 @@ def _build_v4_per_forward_metadata(
         # CSA buffer: [topk_compress (HEAD, uninitialized)] [swa_ring (TAIL)]
         # HEAD section filled later by csa_translate_pack when Indexer runs.
         # Must pre-allocate space for both sections.
-        index_topk = 1024  # DeepSeek-V4 default
-        n_committed_csa_np = (seq_lens_cpu // 4).astype(np.int32)
+        index_topk = int(getattr(attn_md, "_index_topk", DSV4_DEFAULT_INDEX_TOPK))
+        n_committed_csa_np = (seq_lens_cpu // DSV4_CSA_RATIO).astype(np.int32)
 
         csa_all = []
         csa_indptr = [0]
         for t in range(total_tokens):
             bid = int(bid_per_tok[t])
             pos = int(positions_np[t])
-            n_csa = int(min((pos + 1) // 4, int(n_committed_csa_np[bid]), index_topk))
+            n_csa = int(
+                min(
+                    (pos + 1) // DSV4_CSA_RATIO,
+                    int(n_committed_csa_np[bid]),
+                    index_topk,
+                )
+            )
             # HEAD: reserve n_csa slots (filled by csa_translate_pack), init to 0
             csa_all.extend([0] * n_csa)
             # TAIL: SWA ring entries
@@ -643,7 +664,7 @@ def _build_v4_per_forward_metadata(
         # HCA prefix indices
         swa_pages_pf = pool_swa_pages if pool_swa_pages > 0 else 0
         hca_bt = v4_block_tables.get(HCA_KV)
-        hca_k_pf = win // 128
+        hca_k_pf = win // DSV4_HCA_RATIO
         attn_md.kv_indices_prefix_hca, attn_md.kv_indptr_prefix_hca = (
             _build_hca_prefix_indices_gpu(
                 positions_gpu_i32,
@@ -657,7 +678,7 @@ def _build_v4_per_forward_metadata(
         )
 
         # CSA prefix indices (zeros, filled by Indexer topk later)
-        index_topk = 1024
+        index_topk = int(getattr(attn_md, "_index_topk", DSV4_DEFAULT_INDEX_TOPK))
         n_csa_per_seq_gpu = attn_md.n_committed_csa_per_seq
         attn_md.kv_indices_prefix_csa, attn_md.kv_indptr_prefix_csa = (
             _build_csa_prefix_indices_gpu(
@@ -727,9 +748,9 @@ def _build_v4_per_forward_metadata(
 
 
 def _ratio_label(ratio):
-    if ratio == 4:
+    if ratio == DSV4_CSA_RATIO:
         return "csa"
-    elif ratio == 128:
+    elif ratio == DSV4_HCA_RATIO:
         return "hca"
     return "swa"
 
@@ -781,7 +802,7 @@ def _build_compress_plans(
     unique_ratios = sorted(set(r for r in v4_ratios if r > 0))
     unique_ratios_overlap = []
     for r in unique_ratios:
-        is_overlap = r == 4
+        is_overlap = r == DSV4_CSA_RATIO
         unique_ratios_overlap.append((r, is_overlap))
 
     total = int(extend_lens_cpu.sum())
@@ -791,8 +812,12 @@ def _build_compress_plans(
         max_compress = max(total // ratio + bs + 1, 1)
         max_write = max(min(total, bs * K) + 1, 1)
         plan_buffers[ratio] = {
-            "compress": CpuGpuBuffer(max_compress, 4, dtype=torch.int32, device=device),
-            "write": CpuGpuBuffer(max_write, 4, dtype=torch.int32, device=device),
+            "compress": CpuGpuBuffer(
+                max_compress, DSV4_COMPRESS_PLAN_WIDTH, dtype=torch.int32, device=device
+            ),
+            "write": CpuGpuBuffer(
+                max_write, DSV4_COMPRESS_PLAN_WIDTH, dtype=torch.int32, device=device
+            ),
         }
 
     attn_md.compress_plans = make_compress_plans(
