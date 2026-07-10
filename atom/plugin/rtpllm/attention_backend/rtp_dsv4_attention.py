@@ -689,6 +689,161 @@ def _v4_decode_state_scatter(attn_module, state_pool_view, state_block_ids, acti
     state_pool_view[state_block_ids] = torch.cat([kv_flat, sc_flat], dim=-1)
 
 
+def _v4_decode_swa_gather(attn_module, pool_swa, block_ids, active_bs, rows=None):
+    """Gather RTP SWA blocks into compact decode slots.
+
+    Graph syncs all active rows. Eager passes only live-col0 rows because long
+    prompts are initialized separately by its current/previous-block split seed.
+    """
+    if pool_swa is None or block_ids is None or active_bs <= 0:
+        return
+    if rows is None:
+        attn_module.swa_kv[:active_bs].copy_(
+            pool_swa.index_select(0, block_ids[:active_bs])
+        )
+        return
+    if rows.numel() == 0:
+        return
+    selected_ids = block_ids.index_select(0, rows)
+    attn_module.swa_kv.index_copy_(0, rows, pool_swa.index_select(0, selected_ids))
+
+
+def _v4_decode_swa_scatter(attn_module, pool_swa, block_ids, active_bs, rows=None):
+    """Scatter compact decode SWA slots back to their RTP pool blocks."""
+    if pool_swa is None or block_ids is None or active_bs <= 0:
+        return
+    if rows is None:
+        pool_swa.index_copy_(0, block_ids[:active_bs], attn_module.swa_kv[:active_bs])
+        return
+    if rows.numel() == 0:
+        return
+    selected_ids = block_ids.index_select(0, rows)
+    pool_swa.index_copy_(0, selected_ids, attn_module.swa_kv.index_select(0, rows))
+
+
+def _v4_region_block_table(v4_block_tables, ratio):
+    """Return the main KV block table for one V4 attention layer type."""
+    if ratio == 0:
+        return v4_block_tables.get(SWA_KV)
+    if ratio == DSV4_CSA_RATIO:
+        return v4_block_tables.get(CSA_KV)
+    return v4_block_tables.get(HCA_KV)
+
+
+def _prepare_v4_decode_layer_storage(
+    attn_module,
+    device,
+    kv_cache_data,
+    ratio,
+    num_slots,
+):
+    """Shared graph/eager decode storage setup.
+
+    Allocates compact native state once, binds this layer's RTP pools, and makes
+    the compact SWA ring the active kernel view. Graph-only capture fallback is
+    deliberately handled by the graph caller after this common setup.
+    """
+    if not getattr(attn_module, _V4_BUFFERS_ALLOCATED, False):
+        _ensure_v4_native_buffers(
+            attn_module,
+            num_slots=max(num_slots, DSV4_MIN_NATIVE_STATE_SLOTS),
+            device=device,
+        )
+
+    cache_entry = (
+        kv_cache_data.get(f"layer_{attn_module.layer_id}") if kv_cache_data else None
+    )
+    if cache_entry and isinstance(cache_entry.k_cache, dict) and cache_entry.k_cache:
+        _bind_v4_layer_pools(attn_module, cache_entry, ratio)
+
+    compact_swa = getattr(attn_module, "_compact_swa_kv", None)
+    if compact_swa is not None:
+        attn_module.swa_kv = compact_swa
+        attn_module.unified_kv = compact_swa.view(-1, attn_module.head_dim)
+    return cache_entry
+
+
+def _patch_v4_indexer_block_tables(attn_module, attn_md, indexer_bt):
+    """Install the CSA Indexer region redirect once per module instance."""
+    if indexer_bt is not None:
+        attn_md._indexer_block_tables = indexer_bt
+    indexer = getattr(attn_module, "indexer", None)
+    if indexer is None:
+        return
+
+    idx_comp = getattr(indexer, "compressor", None)
+    if idx_comp is not None and not getattr(idx_comp, "_rtp_bt_patched", False):
+        original_comp_forward = idx_comp.forward
+
+        def _patched_comp_fwd(
+            x,
+            plan,
+            state_slot_mapping,
+            block_tables=None,
+            _orig=original_comp_forward,
+        ):
+            from atom.utils.forward_context import get_forward_context
+
+            md = get_forward_context().attn_metadata
+            bt = getattr(md, "_indexer_block_tables", block_tables)
+            return _orig(
+                x,
+                plan=plan,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=bt,
+            )
+
+        idx_comp.forward = _patched_comp_fwd
+        idx_comp._rtp_bt_patched = True
+
+    if not getattr(indexer, "_rtp_score_bt_patched", False):
+        original_score = indexer.indexer_score_topk
+
+        def _patched_score(q_fp8, weights, topk, _orig=original_score):
+            from atom.utils.forward_context import get_forward_context
+
+            md = get_forward_context().attn_metadata
+            saved_bt = md.block_tables
+            md.block_tables = getattr(md, "_indexer_block_tables", saved_bt)
+            try:
+                return _orig(q_fp8, weights, topk)
+            finally:
+                md.block_tables = saved_bt
+
+        indexer.indexer_score_topk = _patched_score
+        indexer._rtp_score_bt_patched = True
+
+
+def _install_v4_decode_layer_metadata(
+    attn_module,
+    attn_md,
+    ratio,
+    v4_block_tables,
+    swa_pages,
+    indexer_n_committed=None,
+    patch_indexer_methods=True,
+):
+    """Shared per-layer metadata installation for graph and eager decode."""
+    attn_md.compress_kv = getattr(attn_module, "_rtp_compress_kv", None)
+    attn_md.swa_pages = swa_pages
+    region_bt = _v4_region_block_table(v4_block_tables, ratio)
+    if region_bt is not None:
+        attn_md.block_tables = region_bt
+
+    if ratio == DSV4_CSA_RATIO:
+        if indexer_n_committed is not None:
+            attn_md.indexer_meta = {
+                "n_committed_per_seq_gpu": indexer_n_committed,
+            }
+        indexer_bt = v4_block_tables.get(INDEXER_KV)
+        if patch_indexer_methods:
+            _patch_v4_indexer_block_tables(attn_module, attn_md, indexer_bt)
+        elif indexer_bt is not None:
+            # Preserve graph capture behavior: install live metadata but do not
+            # mutate Python callables while stream capture is in progress.
+            attn_md._indexer_block_tables = indexer_bt
+
+
 def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     """CUDA Graph fast-path for V4 attention layers.
 
@@ -710,50 +865,33 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     active_bs = int(bufs.get("_active_bs", 0)) or 1
     win = int(bufs["_win"])
 
-    # 1. Ensure native buffers (one-time allocation, guarded by flag)
-    # num_slots = max_bs (compact). state_slot_mapping is remapped to [0..bs-1]
-    # by prepare_cuda_graph, so state buffers only need max_bs entries.
-    # swa_kv is also compact [max_bs, win, head_dim] — gather/scatter handles
-    # the mapping between compact slots and actual pool block positions.
-    if not getattr(self, _V4_BUFFERS_ALLOCATED, False):
-        max_bs = int(bufs["state_slot"].shape[0])
-        _ensure_v4_native_buffers(
-            self, num_slots=max(max_bs, DSV4_MIN_NATIVE_STATE_SLOTS), device=x.device
-        )
-
-    # 2. Bind KV cache from RTP-LLM pool (for compress_kv, compressor, pool_swa)
+    # Compact state is sized to captured max_bs; live slots are remapped to
+    # [0..active_bs-1] by prepare_cuda_graph.
+    max_bs = int(bufs["state_slot"].shape[0])
     kv_cache_data = fc.kv_cache_data
     if kv_cache_data is None:
         _rt = bufs.get("_kv_cache_ref_runtime")
         if _rt is not None:
             kv_cache_data = getattr(_rt, "_rtp_kv_cache_data", None)
-    cache_entry = kv_cache_data.get(f"layer_{self.layer_id}") if kv_cache_data else None
-    if cache_entry and isinstance(cache_entry.k_cache, dict) and cache_entry.k_cache:
-        try:
-            _bind_v4_layer_pools(self, cache_entry, ratio)
-        except Exception as e:
-            rate_limited_log(
-                f"v4_fallback:graph_bind:L{self.layer_id}",
-                logging.ERROR,
-                "graph bind failed — layer %d output ZEROED (garbage): %s",
-                self.layer_id,
-                e,
-                exc_info_first=True,
-            )
-            return _raise_or_zero(
-                fc,
-                x,
-                f"graph KV-pool bind failed for layer {self.layer_id}",
-                e,
-            )
-
-    # After bind: override swa_kv and unified_kv with compact buffer.
-    # This ensures swa_write and paged_decode operate on the SAME independent
-    # memory (not the pool). Pool data is synced via gather/scatter.
-    _compact_swa = getattr(self, "_compact_swa_kv", None)
-    if _compact_swa is not None:
-        self.swa_kv = _compact_swa
-        self.unified_kv = _compact_swa.view(-1, self.head_dim)
+    try:
+        cache_entry = _prepare_v4_decode_layer_storage(
+            self, x.device, kv_cache_data, ratio, max_bs
+        )
+    except Exception as e:
+        rate_limited_log(
+            f"v4_fallback:graph_bind:L{self.layer_id}",
+            logging.ERROR,
+            "graph bind failed — layer %d: %s",
+            self.layer_id,
+            e,
+            exc_info_first=True,
+        )
+        return _raise_or_zero(
+            fc,
+            x,
+            f"graph KV-pool bind failed for layer {self.layer_id}",
+            e,
+        )
 
     if (
         (cache_entry is None or not cache_entry.k_cache)
@@ -807,7 +945,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
                 f"missing runtime-scoped graph SWA pool for layer {self.layer_id}",
             )
 
-    # 3. Set metadata fields from pre-allocated buffers
+    # Attach graph-owned metadata buffers.
     attn_md.state = AttnState.DECODE
     attn_md.state_slot_mapping = bufs["state_slot"][:active_bs]
     # cu_seqlens_q for decode = arange(0..bs); reuse from _cg_meta_bufs
@@ -831,8 +969,6 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     attn_md.kv_indptr_swa = bufs["indptr_swa"]
     attn_md.kv_indptr_csa = bufs["indptr_csa"]
     attn_md.kv_indptr_hca = bufs["indptr_hca"]
-    attn_md.swa_pages = swa_pages_val
-    attn_md.compress_kv = getattr(self, "_rtp_compress_kv", None)
     # skip_prefix_len_csa: pre-allocate and cache
     skip_buf = bufs.get("_skip_prefix_len_csa", None)
     if skip_buf is None:
@@ -840,24 +976,15 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         bufs["_skip_prefix_len_csa"] = skip_buf
     attn_md.skip_prefix_len_csa = skip_buf[:active_bs]
 
-    # Indexer metadata for CSA layers
-    if ratio == DSV4_CSA_RATIO:
-        attn_md.indexer_meta = {
-            "n_committed_per_seq_gpu": bufs["n_csa"][:active_bs],
-        }
-        indexer_bt = v4_block_tables.get(INDEXER_KV)
-        if indexer_bt is not None:
-            attn_md._indexer_block_tables = indexer_bt
-
-    # Set region block_table
-    if ratio == 0:
-        region_bt = v4_block_tables.get(SWA_KV)
-    elif ratio == DSV4_CSA_RATIO:
-        region_bt = v4_block_tables.get(CSA_KV)
-    else:
-        region_bt = v4_block_tables.get(HCA_KV)
-    if region_bt is not None:
-        attn_md.block_tables = region_bt
+    _install_v4_decode_layer_metadata(
+        self,
+        attn_md,
+        ratio,
+        v4_block_tables,
+        swa_pages_val,
+        indexer_n_committed=bufs["n_csa"][:active_bs],
+        patch_indexer_methods=False,
+    )
 
     # Compress plans built by prepare_cuda_graph via CpuGpuBuffer plan buffers.
     # CompressPlan objects reference stable GPU addresses (captured once, replayed).
@@ -868,10 +995,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     # --- Gather: pool[block_ids] → compact swa_kv[0..bs-1] ---
     _block_ids = bufs.get("_block_ids")
     _pool_swa = getattr(self, "_rtp_pool_swa_kv", None)
-    if _block_ids is not None and _pool_swa is not None and active_bs > 0:
-        _bid = _block_ids[:active_bs]  # [active_bs] int64
-        # Gather SWA KV from pool to compact buffer
-        self.swa_kv[:active_bs].copy_(_pool_swa.index_select(0, _bid))
+    _v4_decode_swa_gather(self, _pool_swa, _block_ids, active_bs)
 
     # --- STATE pool gather: pool → compact kv_state/score_state ---
     _state_pool_view_g, _state_block_ids_g = _v4_decode_state_gather(
@@ -898,9 +1022,7 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
         )
 
     # --- Scatter: compact → pool ---
-    if _block_ids is not None and _pool_swa is not None and active_bs > 0:
-        _bid = _block_ids[:active_bs]
-        _pool_swa.index_copy_(0, _bid, self.swa_kv[:active_bs])
+    _v4_decode_swa_scatter(self, _pool_swa, _block_ids, active_bs)
     # STATE scatter
     _v4_decode_state_scatter(self, _state_pool_view_g, _state_block_ids_g, active_bs)
 
@@ -1033,112 +1155,35 @@ def _patched_v4_forward(self, x, positions):
         active_bs = int(getattr(attn_md, "_eager_triton_active_bs", 0))
         swa_pages_val = int(getattr(attn_md, "_eager_triton_swa_pages", 0))
 
-        # Ensure compact native buffers (same as graph: num_slots = max(bs, 32))
-        if not getattr(self, _V4_BUFFERS_ALLOCATED, False):
-            _ensure_v4_native_buffers(
-                self,
-                num_slots=max(active_bs, DSV4_MIN_NATIVE_STATE_SLOTS),
-                device=x.device,
+        kv_cache_data = fc.kv_cache_data
+        try:
+            cache_entry = _prepare_v4_decode_layer_storage(
+                self, x.device, kv_cache_data, ratio, active_bs
+            )
+        except Exception as e:
+            rate_limited_log(
+                f"v4_fallback:eager_bind:L{self.layer_id}",
+                logging.ERROR,
+                "eager decode bind failed — layer %d: %s",
+                self.layer_id,
+                e,
+                exc_info_first=True,
+            )
+            return _raise_or_zero(
+                fc,
+                x,
+                f"eager decode KV-pool bind failed for layer {self.layer_id}",
+                e,
             )
 
-        # Bind KV cache from pool (compress_kv, compressor.kv_cache, pool_swa)
-        kv_cache_data = fc.kv_cache_data
-        cache_entry = (
-            kv_cache_data.get(f"layer_{self.layer_id}") if kv_cache_data else None
+        _install_v4_decode_layer_metadata(
+            self,
+            attn_md,
+            ratio,
+            v4_block_tables,
+            swa_pages_val,
+            indexer_n_committed=attn_md.n_committed_csa_per_seq,
         )
-        if (
-            cache_entry
-            and isinstance(cache_entry.k_cache, dict)
-            and cache_entry.k_cache
-        ):
-            try:
-                _bind_v4_layer_pools(self, cache_entry, ratio)
-            except Exception as e:
-                rate_limited_log(
-                    f"v4_fallback:eager_bind:L{self.layer_id}",
-                    logging.ERROR,
-                    "eager decode bind failed — layer %d output ZEROED (garbage): %s",
-                    self.layer_id,
-                    e,
-                    exc_info_first=True,
-                )
-                return _raise_or_zero(
-                    fc,
-                    x,
-                    f"eager decode KV-pool bind failed for layer {self.layer_id}",
-                    e,
-                )
-
-        # Override swa_kv + unified_kv with compact buffer
-        _compact_swa = getattr(self, "_compact_swa_kv", None)
-        if _compact_swa is not None:
-            self.swa_kv = _compact_swa
-            self.unified_kv = _compact_swa.view(-1, self.head_dim)
-
-        # Set per-layer metadata (compress_kv for dual-pointer, block_tables, swa_pages)
-        attn_md.compress_kv = getattr(self, "_rtp_compress_kv", None)
-        attn_md.swa_pages = swa_pages_val
-        if ratio == 0:
-            region_bt = v4_block_tables.get(SWA_KV)
-        elif ratio == DSV4_CSA_RATIO:
-            region_bt = v4_block_tables.get(CSA_KV)
-        else:
-            region_bt = v4_block_tables.get(HCA_KV)
-        if region_bt is not None:
-            attn_md.block_tables = region_bt
-
-        # Indexer block_table patch (CSA layers)
-        if ratio == DSV4_CSA_RATIO:
-            from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import INDEXER_KV
-
-            indexer_bt = v4_block_tables.get(INDEXER_KV)
-            if indexer_bt is not None:
-                attn_md._indexer_block_tables = indexer_bt
-            if self.indexer is not None:
-                idx_comp = getattr(self.indexer, "compressor", None)
-                if idx_comp is not None and not getattr(
-                    idx_comp, "_rtp_bt_patched", False
-                ):
-                    _orig_comp_fwd = idx_comp.forward
-
-                    def _patched_comp_fwd(
-                        x,
-                        plan,
-                        state_slot_mapping,
-                        block_tables=None,
-                        _orig=_orig_comp_fwd,
-                    ):
-                        from atom.utils.forward_context import get_forward_context
-
-                        md = get_forward_context().attn_metadata
-                        bt = getattr(md, "_indexer_block_tables", block_tables)
-                        return _orig(
-                            x,
-                            plan=plan,
-                            state_slot_mapping=state_slot_mapping,
-                            block_tables=bt,
-                        )
-
-                    idx_comp.forward = _patched_comp_fwd
-                    idx_comp._rtp_bt_patched = True
-                if not getattr(self.indexer, "_rtp_score_bt_patched", False):
-                    _orig_score = self.indexer.indexer_score_topk
-
-                    def _patched_score(q_fp8, weights, topk, _orig=_orig_score):
-                        from atom.utils.forward_context import get_forward_context
-
-                        fc2 = get_forward_context()
-                        md = fc2.attn_metadata
-                        saved_bt = md.block_tables
-                        idx_bt = getattr(md, "_indexer_block_tables", saved_bt)
-                        md.block_tables = idx_bt
-                        try:
-                            return _orig(q_fp8, weights, topk)
-                        finally:
-                            md.block_tables = saved_bt
-
-                    self.indexer.indexer_score_topk = _patched_score
-                    self.indexer._rtp_score_bt_patched = True
 
         # --- STATE pool gather: pool → compact kv_state/score_state ---
         # RTP-LLM manages STATE pool lifecycle (alloc/free/zero-init). We gather
@@ -1195,10 +1240,14 @@ def _patched_v4_forward(self, x, positions):
 
         # Per-step col0 ring gather (only pos<win rows now — see metadata).
         _swa_rows = getattr(attn_md, "_eager_swa_gather_rows", None)
-        if _pool_swa is not None and _swa_rows is not None and _swa_rows.numel() > 0:
-            _bid_valid = _triton_block_ids.index_select(0, _swa_rows)
-            _gathered = _pool_swa.index_select(0, _bid_valid)
-            self.swa_kv.index_copy_(0, _swa_rows, _gathered)
+        if _swa_rows is not None:
+            _v4_decode_swa_gather(
+                self,
+                _pool_swa,
+                _triton_block_ids,
+                active_bs,
+                rows=_swa_rows,
+            )
 
         try:
             result = self.forward_impl(x, positions)
@@ -1223,10 +1272,14 @@ def _patched_v4_forward(self, x, positions):
         # --- Scatter: compact → pool, ONLY for valid-col0 rows ---
         # Skipping freed-col0 rows also avoids polluting physical block 0 (the
         # -1 clamp target), which may belong to another live request in a batch.
-        if _pool_swa is not None and _swa_rows is not None and _swa_rows.numel() > 0:
-            _bid_valid = _triton_block_ids.index_select(0, _swa_rows)
-            _src = self.swa_kv.index_select(0, _swa_rows)
-            _pool_swa.index_copy_(0, _bid_valid, _src)
+        if _swa_rows is not None:
+            _v4_decode_swa_scatter(
+                self,
+                _pool_swa,
+                _triton_block_ids,
+                active_bs,
+                rows=_swa_rows,
+            )
         # STATE scatter
         _v4_decode_state_scatter(self, _state_pool_view, _state_block_ids, active_bs)
 
