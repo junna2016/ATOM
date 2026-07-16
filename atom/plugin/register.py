@@ -9,6 +9,7 @@ except (ImportError, ModuleNotFoundError):
     Glm4MoeForCausalLM = None
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
 from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+from atom.models.deepseek_v4_mtp import DeepseekV4MTP
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGenerationTextOnly,
@@ -28,6 +29,7 @@ _ATOM_SUPPORTED_MODELS = {
     "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
+    "DeepseekV4MTPModel": DeepseekV4MTP,
     "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,

@@ -16,7 +16,10 @@ from rtp_llm.model_factory_register import (
 
 from atom.plugin.rtpllm.models.glm5 import ATOMGlm5Moe
 from atom.plugin.rtpllm.models.qwen3_5 import ATOMQwen35Moe
-from atom.plugin.rtpllm.models.deepseek_v4 import ATOMDeepSeekV4
+from atom.plugin.rtpllm.models.deepseek_v4 import (
+    ATOMDeepSeekV4,
+    ATOMDeepSeekV4Mtp,
+)
 
 
 def _register_atom_qwen35_moe() -> None:
@@ -41,7 +44,9 @@ def _register_atom_deepseek_v4() -> None:
     """Register ATOM's rtp-llm model hook for DeepSeek-V4."""
     register_model("atom_deepseek_v4", ATOMDeepSeekV4, [])
     _model_factory["deepseek_v4"] = ATOMDeepSeekV4
+    _model_factory["deepseek_v4_mtp"] = ATOMDeepSeekV4Mtp
     _hf_architecture_2_ft["DeepseekV4ForCausalLM"] = "deepseek_v4"
+    _hf_architecture_2_ft["DeepseekV4ForCausalLMNextN"] = "deepseek_v4_mtp"
 
 
 _register_atom_qwen35_moe()

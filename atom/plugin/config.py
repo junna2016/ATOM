@@ -431,7 +431,7 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
     # only enable EP when ep_size > 1; pure TP (ep_size == 1) must not use EP.
     rtpllm_ep_size = getattr(rtpllm_parallelism_config, "ep_size", 1)
 
-    return Config(
+    atom_config = Config(
         model=rtpllm_model_config.ckpt_path,
         max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
         max_num_seqs=max_generate_batch_size,
@@ -452,6 +452,17 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
         enable_dp_attention=False,
         plugin_config=plugin_config,
     )
+
+    # RTP-LLM creates the target and MTP draft as two independent BaseModel
+    # instances that point at the same checkpoint.  The checkpoint advertises
+    # the target architecture, so rewrite only the draft instance to ATOM's
+    # MTP architecture after Config has loaded the complete V4 HF metadata.
+    if bool(getattr(rtpllm_model_config, "is_mtp", False)):
+        from atom.config import SpeculativeConfig
+
+        SpeculativeConfig.hf_config_override(atom_config.hf_config, atom_config.model)
+
+    return atom_config
 
 
 def generate_atom_config_for_plugin_mode(config: Any = None):

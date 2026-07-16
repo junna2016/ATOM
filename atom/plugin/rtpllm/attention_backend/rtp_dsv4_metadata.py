@@ -30,6 +30,39 @@ from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
 logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.rtp_dsv4_metadata")
 
 
+def _forward_mode(attn_inputs, bs):
+    """Classify RTP's overloaded ``is_prefill`` flag for V4.
+
+    MTP draft continuation is reported by RTP as ``is_prefill=True`` even
+    though it starts at a non-zero ``prefix_lengths`` and must use decode/ring
+    semantics.  Treating it as a fresh prefill makes the extend-index builder
+    use absolute positions as rows in the current-forward KV tensor.  For
+    example, a two-token continuation at prefix 17 generated rows [0..17] for
+    a KV tensor with only two rows, causing a device-side OOB access.
+    """
+    is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+    is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
+    prefix = getattr(attn_inputs, "prefix_lengths", None)
+    prefix_cpu = (
+        prefix.detach().cpu().numpy().astype(np.int32)
+        if prefix is not None and prefix.numel() == bs
+        else np.zeros(bs, dtype=np.int32)
+    )
+    is_prefill_continuation = (
+        is_prefill and not is_target_verify and bool(np.any(prefix_cpu > 0))
+    )
+    is_context_prefill = (
+        is_prefill and not is_target_verify and not is_prefill_continuation
+    )
+    return (
+        is_prefill,
+        is_target_verify,
+        is_context_prefill,
+        is_prefill_continuation,
+        prefix_cpu,
+    )
+
+
 def _build_eager_decode_with_triton(
     attn_md,
     attn_inputs,
@@ -38,6 +71,7 @@ def _build_eager_decode_with_triton(
     region_to_group,
     device,
     window_size=DSV4_DEFAULT_WINDOW_SIZE,
+    swa_stride=None,
     pool_swa_pages=0,
     index_topk=DSV4_DEFAULT_INDEX_TOPK,
 ):
@@ -63,7 +97,9 @@ def _build_eager_decode_with_triton(
         return False
     bs = int(input_lengths.numel())
     win = window_size
-    cs = win  # win_with_spec = window_size (no MTP spec steps in plugin mode)
+    # Logical visibility remains `win`; addressing uses the physical RTP ring
+    # stride, which includes MTP speculative-write slack.
+    cs = int(swa_stride or win)
 
     # --- Positions ---
     seq_lens = getattr(attn_inputs, "sequence_lengths", None)
@@ -360,6 +396,7 @@ def _build_v4_per_forward_metadata(
     region_to_group,
     device,
     window_size=DSV4_DEFAULT_WINDOW_SIZE,
+    swa_stride=None,
     pool_swa_pages=0,
 ):
     """Construct V4-specific attention metadata from RTP-LLM inputs.
@@ -369,16 +406,22 @@ def _build_v4_per_forward_metadata(
     """
     from atom.utils.forward_context import AttnState
 
-    is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
     raw_input_lengths = getattr(attn_inputs, "input_lengths", None)
     if raw_input_lengths is None or raw_input_lengths.numel() == 0:
         setattr(attn_md, _V4_META_BUILT_ATTR, True)
         setattr(attn_md, _V4_META_FAILED_ATTR, True)
         return
     bs = raw_input_lengths.shape[0]
-
-    if is_prefill:
+    (
+        is_prefill,
+        is_target_verify,
+        is_context_prefill,
+        is_prefill_continuation,
+        prefix_cpu,
+    ) = _forward_mode(attn_inputs, bs)
+    if is_prefill or is_target_verify:
         # Prefill: input_lengths = number of new tokens per sequence
+        # Target verify: input_lengths = accepted token + draft width.
         input_lengths = raw_input_lengths
     else:
         # Decode: RTP-LLM sends total seq_len as input_lengths, not new token count.
@@ -393,43 +436,60 @@ def _build_v4_per_forward_metadata(
     input_lens_cpu = input_lengths.cpu().numpy().astype(np.int32)
 
     # -- state (DECODE / PREFILL) --
-    if is_prefill:
+    if is_context_prefill:
         attn_md.state = AttnState.PREFILL_NATIVE
     else:
         attn_md.state = AttnState.DECODE
 
-    # -- state_slot_mapping from SWA_KV block table (fixed alloc, 1 block = 1 slot) --
+    # -- state_slot_mapping from SWA_KV block table --
     swa_bt = select_block_table_for_region(attn_inputs, SWA_KV, region_to_group)
+    decode_swa_block_ids_raw_np = None
+    decode_swa_block_ids_np = None
     if swa_bt is not None and swa_bt.numel() >= bs:
-        # state_slot per sequence (indexes the compressor STATE shadow AND the
-        # SWA write). Normally this is the SWA block-table col0. For a prompt
-        # longer than 2*win, col0 is a FREED slot (-1); naively clamping every
-        # such sequence to 0 makes them all share state slot 0, so:
-        #   - sequentially, the Python STATE scatter's kv_state[-1] negative
-        #     index (vs the kernel's -1->0 clamp) mismatched -> a prior request's
-        #     state leaked into the STATE pool (cross-request contamination); and
-        #   - concurrently, multiple >2*win prompts collide on shadow slot 0,
-        #     corrupting each other's compressor state (degeneration).
-        # Fix: keep col0 for live sequences (unchanged), but for a FREED col0 use
-        # that sequence's CURRENT (newest, last non-negative column) SWA block —
-        # a live, per-sequence-DISTINCT, valid block. Concurrent long prompts get
-        # distinct physical blocks from RTP, so their state slots no longer clash.
-        _raw = swa_bt[:bs]
-        _cols = int(_raw.shape[1])
-        _colidx = torch.arange(_cols, device=_raw.device, dtype=_raw.dtype).unsqueeze(0)
-        _last_valid_col = (
-            torch.where(_raw >= 0, _colidx, torch.full_like(_raw, -1))
-            .max(dim=1)
-            .values.clamp(min=0)
-        )
-        _cur_block = _raw.gather(1, _last_valid_col.long().unsqueeze(1)).squeeze(1)
-        _col0 = swa_bt[:bs, 0]
-        _ssm = (
-            torch.where(_col0 >= 0, _col0, _cur_block)
-            .clamp(min=0)
-            .to(dtype=torch.int32, device=device)
-        )
-        attn_md.state_slot_mapping = _ssm.as_strided(_ssm.shape, (1,) * _ssm.dim())
+        if is_context_prefill:
+            # Fresh prefill writes directly into RTP's physical SWA pool, so
+            # state slots must be physical block ids. Normally this is col0.
+            # For a prompt longer than 2*win col0 may already be freed (-1);
+            # use the newest live block to keep concurrent requests distinct.
+            _raw = swa_bt[:bs]
+            _cols = int(_raw.shape[1])
+            _colidx = torch.arange(
+                _cols, device=_raw.device, dtype=_raw.dtype
+            ).unsqueeze(0)
+            _last_valid_col = (
+                torch.where(_raw >= 0, _colidx, torch.full_like(_raw, -1))
+                .max(dim=1)
+                .values.clamp(min=0)
+            )
+            _cur_block = _raw.gather(
+                1, _last_valid_col.long().unsqueeze(1)
+            ).squeeze(1)
+            _col0 = swa_bt[:bs, 0]
+            _ssm = (
+                torch.where(_col0 >= 0, _col0, _cur_block)
+                .clamp(min=0)
+                .to(dtype=torch.int32, device=device)
+            )
+        else:
+            # Target verify and MTP draft continuation are multi-token DECODE,
+            # even though RTP reports is_prefill=True. They must use the same
+            # compact state/SWA ring as ordinary eager decode so compressor
+            # state is gathered from and scattered back to RTP's STATE pool.
+            #
+            # The old physical-slot mapping fell through the prefill storage
+            # path in rtp_dsv4_attention.py, which zeroed kv_state/score_state
+            # on every verify cycle. That is numerically catastrophic but does
+            # not necessarily crash: target logits quickly degenerate into
+            # repetitive garbage while invalid draft tokens may still be
+            # accepted.
+            _ssm = torch.arange(bs, dtype=torch.int32, device=device)
+            decode_swa_block_ids_raw_np = (
+                swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
+            )
+            decode_swa_block_ids_np = np.maximum(
+                decode_swa_block_ids_raw_np, 0
+            ).astype(np.int64)
+        attn_md.state_slot_mapping = _ssm
         attn_md.state_slot_mapping_cpu = attn_md.state_slot_mapping.cpu().numpy().copy()
     else:
         attn_md.state_slot_mapping = torch.arange(bs, dtype=torch.int32, device=device)
@@ -453,13 +513,9 @@ def _build_v4_per_forward_metadata(
         attn_md.batch_id_per_token = torch.zeros(1, dtype=torch.int32, device=device)
 
     # -- prefix / seq_lens (computed once, reused by compress_plans and n_committed) --
-    prefix = getattr(attn_inputs, "prefix_lengths", None)
-    prefix_cpu = (
-        prefix.cpu().numpy().astype(np.int32)
-        if prefix is not None
-        else np.zeros(bs, dtype=np.int32)
-    )
-    if is_prefill:
+    if is_context_prefill:
+        seq_lens_cpu = (prefix_cpu + input_lens_cpu).astype(np.int32)
+    elif is_target_verify or is_prefill_continuation:
         seq_lens_cpu = (prefix_cpu + input_lens_cpu).astype(np.int32)
     else:
         seq_lens = getattr(attn_inputs, "sequence_lengths", None)
@@ -503,7 +559,7 @@ def _build_v4_per_forward_metadata(
     # V4 ALWAYS uses sparse_attn_v4_paged_prefill/decode, never flash_attn.
     ssm = attn_md.state_slot_mapping
     win = window_size  # sliding window size from model config
-    cs = win  # win_with_spec = window_size + max_spec_steps (0 when MTP off)
+    cs = int(swa_stride or win)  # physical SWA ring stride (may exceed `win`)
     total_tokens = int(input_lens_cpu.sum())
 
     # swa_pages: boundary in unified_kv between SWA [0,swa_pages) and compress [swa_pages,...)
@@ -516,7 +572,7 @@ def _build_v4_per_forward_metadata(
     pos_tensor = getattr(attn_inputs, "position_ids", None)
     if pos_tensor is not None and pos_tensor.numel() > 0:
         positions_np = pos_tensor.cpu().numpy().astype(np.int32)
-    elif not is_prefill:
+    elif not is_context_prefill:
         # Decode: position = sequence_lengths (absolute position of new token)
         seq_lens = getattr(attn_inputs, "sequence_lengths", None)
         if seq_lens is not None and seq_lens.numel() >= bs:
@@ -537,12 +593,47 @@ def _build_v4_per_forward_metadata(
         )
         positions_np = positions_gpu.cpu().numpy().astype(np.int32)
 
+    if not is_context_prefill:
+        # Route general multi-token continuation metadata through the exact
+        # eager-decode storage lifecycle in rtp_dsv4_attention.py. The marker
+        # name is historical ("triton"), but the attached block ids merely
+        # select compact-ring gather/scatter and do not require Triton-built
+        # indices.
+        if decode_swa_block_ids_np is None:
+            decode_swa_block_ids_np = np.arange(bs, dtype=np.int64)
+            decode_swa_block_ids_raw_np = decode_swa_block_ids_np.astype(np.int32)
+        attn_md._eager_triton_block_ids = torch.from_numpy(
+            decode_swa_block_ids_np
+        ).to(device=device, dtype=torch.int64)
+        attn_md._eager_triton_active_bs = bs
+        attn_md._eager_triton_swa_pages = int(attn_md.swa_pages)
+
+        # Pool seeding/gather must describe the cache state immediately before
+        # the first token in each request's packed continuation span.
+        first_token_rows = cu[:-1].detach().cpu().numpy().astype(np.int64)
+        start_positions_np = positions_np[first_token_rows]
+        valid_rows_np = np.nonzero(
+            (decode_swa_block_ids_raw_np >= 0) & (start_positions_np < win)
+        )[0].astype(np.int64)
+        attn_md._eager_swa_gather_rows = torch.from_numpy(valid_rows_np).to(
+            device=device, dtype=torch.int64
+        )
+        attn_md._eager_triton_positions = torch.from_numpy(
+            start_positions_np.astype(np.int64)
+        ).to(device=device)
+        attn_md._eager_swa_bt_cpu = (
+            swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+            if swa_bt is not None and swa_bt.numel() >= bs
+            else None
+        )
+        attn_md._eager_swa_positions_cpu = start_positions_np.copy()
+
     cu_q_cpu = np.zeros(bs + 1, dtype=np.int32)
     np.cumsum(input_lens_cpu, out=cu_q_cpu[1:])
     bid_per_tok = np.repeat(np.arange(bs, dtype=np.int32), input_lens_cpu)
     ssm_cpu = ssm.cpu().numpy().astype(np.int32)
 
-    if not is_prefill:
+    if not is_context_prefill:
         # === DECODE: per-ratio ragged indices [compress_HEAD, swa_TAIL] ===
         # SWA indices < swa_pages → dual-ptr kernel reads from swa_kv
         # Compress indices >= swa_pages → dual-ptr kernel reads from compress_kv
@@ -577,7 +668,7 @@ def _build_v4_per_forward_metadata(
         attn_md.kv_indices_swa = idx_swa
         attn_md.kv_indptr_swa = ptr_swa
 
-        # HCA buffer: SWA-only for isolation test (disable compress entries)
+        # HCA buffer: committed compressed entries followed by the SWA tail.
         hca_k = win // DSV4_HCA_RATIO
         hca_bt = v4_block_tables.get(HCA_KV)
         hca_bt_cpu = hca_bt.cpu().numpy() if hca_bt is not None else None
@@ -702,7 +793,7 @@ def _build_v4_per_forward_metadata(
     n_committed_cpu = n_committed.cpu().numpy().astype(np.int32)
     attn_md.n_committed_csa_per_seq_cpu = n_committed_cpu
 
-    if not is_prefill:
+    if not is_context_prefill:
         # DECODE: only needs n_committed_per_seq_gpu
         attn_md.indexer_meta = {
             "n_committed_per_seq_gpu": n_committed,
@@ -771,19 +862,29 @@ def _build_compress_plans(
     from atom.model_ops.v4_kernels.compress_plan import make_compress_plans
     from atom.utils import CpuGpuBuffer
 
-    is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
     if input_lens_cpu is None:
         input_lens_cpu = attn_inputs.input_lengths.cpu().numpy().astype(np.int32)
+    bs = int(bs)
+    if prefix_cpu is None:
+        (
+            is_prefill,
+            is_target_verify,
+            is_context_prefill,
+            is_prefill_continuation,
+            prefix_cpu,
+        ) = _forward_mode(attn_inputs, bs)
+    else:
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
+        is_prefill_continuation = (
+            is_prefill and not is_target_verify and bool(np.any(prefix_cpu > 0))
+        )
+        is_context_prefill = (
+            is_prefill and not is_target_verify and not is_prefill_continuation
+        )
 
-    if is_prefill:
+    if is_context_prefill or is_target_verify or is_prefill_continuation:
         extend_lens_cpu = input_lens_cpu.copy()
-        if prefix_cpu is None:
-            prefix = getattr(attn_inputs, "prefix_lengths", None)
-            prefix_cpu = (
-                prefix.cpu().numpy().astype(np.int32)
-                if prefix is not None
-                else np.zeros(bs, dtype=np.int32)
-            )
         context_lens_cpu = (
             (prefix_cpu + input_lens_cpu).astype(np.int32)
             if seq_lens_cpu is None

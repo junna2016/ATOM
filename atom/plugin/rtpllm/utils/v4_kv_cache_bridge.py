@@ -465,6 +465,13 @@ def is_v4_model(runtime: Any) -> bool:
 
 def get_v4_compress_ratios(runtime: Any) -> list[int]:
     """Extract compress_ratios from the ATOM V4 model."""
+    # Draft MTP uses a separate one-layer RTP KV cache even though the ATOM
+    # checkpoint model keeps the original absolute layer id (the trailing
+    # compress-ratio entry).  Runtime adapters may expose the local cache
+    # schedule explicitly to avoid probing target-layer cache ids.
+    runtime_ratios = getattr(runtime, "_compress_ratios", None)
+    if runtime_ratios is not None:
+        return list(runtime_ratios)
     model = getattr(runtime, "model", None)
     if model is None:
         return []

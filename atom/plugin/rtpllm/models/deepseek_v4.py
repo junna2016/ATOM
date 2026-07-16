@@ -49,6 +49,12 @@ from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
 
 logger = logging.getLogger("atom.plugin.rtpllm.models.deepseek_v4")
 
+# RTP-LLM constructs the target and draft BaseModel independently, while V4
+# MTP shares embedding/lm-head modules with the target.  Each backend process
+# owns one rank, so the TP rank is a stable registry key during model loading.
+_ATOM_V4_TARGETS_BY_TP_RANK: dict[int, torch.nn.Module] = {}
+
+
 # ---------------------------------------------------------------------------
 # Plugin-side torch.profiler (bypasses rtp-llm C++ StepWindowProfiler)
 # Controlled by env vars:
@@ -535,6 +541,122 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
             or getattr(model_config, "max_position_embeddings", 0)
             or 32768
         )
+        model_args = getattr(atom_model, "args", None) or getattr(
+            getattr(atom_model, "model", None), "args", None
+        )
+        all_ratios = list(getattr(model_args, "compress_ratios", ()))
+        self._compress_ratios = all_ratios[: int(model_config.num_layers)]
+        self._mtp_enabled = bool(
+            getattr(model_config, "is_mtp", False)
+            or int(getattr(model_config, "gen_num_per_cycle", 0) or 0) > 0
+        )
+        self._mtp_hidden_buffer: torch.Tensor | None = None
+        self._mtp_hidden_valid_tokens = 0
+        self._mtp_last_hidden_buffer: torch.Tensor | None = None
+        self._mtp_last_hidden_valid_tokens = 0
+
+    @staticmethod
+    def _build_rtp_positions(attn_inputs, input_ids, device) -> torch.Tensor:
+        """Return flattened per-token positions for prefill/decode/verify."""
+        explicit = getattr(attn_inputs, "position_ids", None)
+        if explicit is not None and explicit.numel() == input_ids.numel():
+            return explicit.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+
+        input_lengths = getattr(attn_inputs, "input_lengths", None)
+        if input_lengths is None or input_lengths.numel() == 0:
+            raise ValueError("ATOM V4 requires non-empty attention input_lengths")
+        q_lens = input_lengths.to(device=device, dtype=torch.int32)
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
+
+        if is_target_verify:
+            # Target verify packs (accepted token + drafts) for each request.
+            # RTP marks this as prefill but prefix_lengths is the absolute
+            # position at which that packed span starts.
+            prefix = getattr(attn_inputs, "prefix_lengths", None)
+            if prefix is None or prefix.numel() != q_lens.numel():
+                raise ValueError(
+                    "ATOM V4 target verify requires one prefix_length per request"
+                )
+            starts = prefix.to(device=device, dtype=torch.int32)
+        elif is_prefill:
+            prefix = getattr(attn_inputs, "prefix_lengths", None)
+            starts = (
+                prefix.to(device=device, dtype=torch.int32)
+                if prefix is not None and prefix.numel() == q_lens.numel()
+                else torch.zeros_like(q_lens)
+            )
+        else:
+            seq_lens = getattr(attn_inputs, "sequence_lengths", None)
+            if seq_lens is None or seq_lens.numel() == 0:
+                raise ValueError("ATOM V4 decode requires sequence_lengths")
+            starts = seq_lens.to(device=device, dtype=torch.int32)
+            q_lens = torch.ones_like(starts)
+
+        total = int(q_lens.sum().item())
+        if total != int(input_ids.numel()):
+            raise ValueError(
+                "ATOM V4 position metadata/token mismatch: "
+                f"q_lens_sum={total}, input_tokens={input_ids.numel()}"
+            )
+        cu = torch.zeros(q_lens.numel() + 1, dtype=torch.int32, device=device)
+        torch.cumsum(q_lens, dim=0, out=cu[1:])
+        repeated_starts = torch.repeat_interleave(starts, q_lens)
+        repeated_offsets = torch.repeat_interleave(cu[:-1], q_lens)
+        return (
+            repeated_starts
+            + torch.arange(total, dtype=torch.int32, device=device)
+            - repeated_offsets
+        ).contiguous()
+
+    def _record_mtp_hidden_states(self, hidden_states_hc, attn_inputs) -> None:
+        if not self._mtp_enabled:
+            return
+        flat = hidden_states_hc.reshape(hidden_states_hc.size(0), -1)
+        self._mtp_hidden_buffer = flat
+        self._mtp_hidden_valid_tokens = int(flat.size(0))
+
+        input_lengths = getattr(attn_inputs, "input_lengths", None)
+        if input_lengths is None or input_lengths.numel() == 0:
+            self._mtp_last_hidden_buffer = flat[-1:]
+        else:
+            q_lens = input_lengths.to(device=flat.device, dtype=torch.int64)
+            if int(q_lens.sum().item()) == int(flat.size(0)):
+                last_rows = torch.cumsum(q_lens, dim=0) - 1
+                self._mtp_last_hidden_buffer = flat.index_select(0, last_rows)
+            else:
+                self._mtp_last_hidden_buffer = flat[-1:]
+        self._mtp_last_hidden_valid_tokens = int(self._mtp_last_hidden_buffer.size(0))
+
+    def get_mtp_target_hidden_states(self, num_tokens: int):
+        if self._mtp_hidden_buffer is None:
+            return None
+        requested = (
+            self._mtp_hidden_valid_tokens if int(num_tokens) < 0 else int(num_tokens)
+        )
+        if requested > self._mtp_hidden_valid_tokens:
+            raise RuntimeError(
+                "ATOM V4 MTP hidden request exceeds rows written: "
+                f"requested={requested}, valid={self._mtp_hidden_valid_tokens}"
+            )
+        return self._mtp_hidden_buffer[:requested]
+
+    def get_mtp_last_hidden_states(self, num_tokens: int):
+        if self._mtp_last_hidden_buffer is None:
+            return None
+        requested = (
+            self._mtp_last_hidden_valid_tokens
+            if int(num_tokens) < 0
+            else int(num_tokens)
+        )
+        if requested > self._mtp_last_hidden_valid_tokens:
+            raise RuntimeError(
+                "ATOM V4 MTP last-hidden request exceeds rows written: "
+                f"requested={requested}, valid={self._mtp_last_hidden_valid_tokens}"
+            )
+        return self._mtp_last_hidden_buffer[:requested]
 
     def load_weights(self):
         return None
@@ -893,49 +1015,32 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise ValueError("ATOM V4 forward requires attention_inputs")
-        positions = getattr(attn_inputs, "position_ids", None) if attn_inputs else None
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
-        if positions is not None:
+            if self._mtp_enabled:
+                raise RuntimeError(
+                    "ATOM RTP DeepSeek-V4 MTP currently supports eager mode only; "
+                    "start with ENABLE_CUDA_GRAPH=0"
+                )
+
+        if is_cuda_graph:
+            # Preserve the established one-token decode graph path.  Its
+            # identity buffers are populated by prepare_cuda_graph before
+            # capture/replay; the ragged eager builder below must not run in
+            # graph capture because it performs dynamic allocations.
+            positions = getattr(attn_inputs, "position_ids", None)
+            if positions is None or positions.numel() != input_ids.numel():
+                positions = getattr(attn_inputs, "sequence_lengths", None)
+            if positions is None or positions.numel() != input_ids.numel():
+                raise ValueError(
+                    "ATOM V4 graph decode requires one position per input token"
+                )
             positions = positions.to(
                 device=model_device, dtype=torch.int32, non_blocking=True
             ).contiguous()
         else:
-            is_prefill = (
-                bool(getattr(attn_inputs, "is_prefill", True)) if attn_inputs else True
-            )
-            if not is_prefill and attn_inputs is not None:
-                # Decode: position = sequence_lengths (absolute position of new token)
-                seq_lens = getattr(attn_inputs, "sequence_lengths", None)
-                if seq_lens is not None and seq_lens.numel() > 0:
-                    positions = seq_lens.to(
-                        device=model_device, dtype=torch.int32, non_blocking=True
-                    ).contiguous()
-                else:
-                    raise ValueError(
-                        "ATOM V4 decode requires position_ids or sequence_lengths"
-                    )
-            else:
-                # Prefill: construct per-sequence positions [0,..,L1-1, 0,..,L2-1, ...]
-                # NOT cumulative [0,..,L1+L2-1] — SWA ring buffer needs per-seq positions.
-                num_tokens = input_ids.numel() if input_ids is not None else 1
-                _inp_lens = (
-                    getattr(attn_inputs, "input_lengths", None) if attn_inputs else None
-                )
-                if _inp_lens is not None and _inp_lens.numel() > 1:
-                    _lens_cpu = _inp_lens.cpu().tolist()
-                    positions = torch.cat(
-                        [
-                            torch.arange(
-                                int(seq_len), dtype=torch.int32, device=model_device
-                            )
-                            for seq_len in _lens_cpu
-                        ]
-                    )
-                else:
-                    positions = torch.arange(
-                        num_tokens, dtype=torch.int32, device=model_device
-                    )
+            positions = self._build_rtp_positions(attn_inputs, input_ids, model_device)
+        attn_inputs.position_ids = positions
 
         # Build int64 positions for model forward (RoPE kernel requires int64).
         # bind() needs int32 (slot_mapping). Graph mode uses pre-allocated buffer.
@@ -955,23 +1060,33 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         else:
             pos_i64 = positions.to(dtype=torch.int64)
 
+        from atom.config import use_custom_atom_config
         from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
 
-        with RTPForwardContext.bind(
-            model=self.model,
-            runtime=self,
-            inputs=inputs,
-            positions=positions,
-            layer_maps=self._rtp_layer_maps,
-            cg_max_seq_len=int(self._cg_max_seq_len),
-            cg_bufs=getattr(self, "_cg_meta_bufs", None),
-        ):
-            # In CUDA Graph mode, run V4 index construction Triton kernels
-            # INSIDE the captured graph block. These read from pre-allocated
-            # buffers (updated by prepare_cuda_graph before replay).
-            if is_cuda_graph:
-                self._run_v4_graph_index_kernels()
-            hidden_states_hc = self.model(input_ids=input_ids, positions=pos_i64)
+        # RTP keeps target and MTP draft models in the same process.  Each owns
+        # an independent ATOM Config/static_forward_context, while ATOM's custom
+        # ops resolve their module by name through get_current_atom_config().
+        # Bind the config per forward; otherwise creation of the draft leaves
+        # the global singleton pointing at the draft and target MoE lookup
+        # (`layers.0.ffn.experts`) fails with KeyError.
+        with use_custom_atom_config(self.model.atom_config):
+            with RTPForwardContext.bind(
+                model=self.model,
+                runtime=self,
+                inputs=inputs,
+                positions=positions,
+                layer_maps=self._rtp_layer_maps,
+                cg_max_seq_len=int(self._cg_max_seq_len),
+                cg_bufs=getattr(self, "_cg_meta_bufs", None),
+            ):
+                # In CUDA Graph mode, run V4 index construction Triton kernels
+                # INSIDE the captured graph block. These read from pre-allocated
+                # buffers (updated by prepare_cuda_graph before replay).
+                if is_cuda_graph:
+                    self._run_v4_graph_index_kernels()
+                hidden_states_hc = self.model(input_ids=input_ids, positions=pos_i64)
+
+        self._record_mtp_hidden_states(hidden_states_hc, attn_inputs)
 
         hidden_states = self.model.model.head.hc_head(
             hidden_states_hc,
@@ -1059,6 +1174,89 @@ class _ATOMDeepSeekV4Runtime(GptModelBase):
         attn_md._v4_swa_pages = swa_pages_val
 
 
+class _ATOMDeepSeekV4MtpRuntime(_ATOMDeepSeekV4Runtime):
+    """RTP draft-model adapter backed by ATOM's one-layer V4 MTP model."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # RTP gives the draft an independent one-layer cache.  ATOM keeps the
+        # checkpoint's absolute MTP layer id (target_layers + 0), so normalize
+        # runtime cache addressing without changing parameter names.
+        self._compress_ratios = [0]
+        for module in self.model.modules():
+            if module.__class__.__name__ == "DeepseekV4Attention":
+                module.layer_id = 0
+        from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
+
+        self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
+
+    def _forward_impl(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        if bool(getattr(fmha_impl, "is_cuda_graph", False)):
+            raise RuntimeError(
+                "ATOM RTP DeepSeek-V4 MTP currently supports eager mode only; "
+                "start with ENABLE_CUDA_GRAPH=0"
+            )
+
+        model_device = self._model_device
+        input_ids = getattr(inputs, "input_ids", None)
+        if input_ids is None or input_ids.numel() == 0:
+            raise ValueError("ATOM V4 MTP forward requires non-empty input_ids")
+        input_ids = input_ids.to(device=model_device, non_blocking=True)
+
+        attn_inputs = getattr(inputs, "attention_inputs", None)
+        if attn_inputs is None:
+            raise ValueError("ATOM V4 MTP forward requires attention_inputs")
+        positions = self._build_rtp_positions(attn_inputs, input_ids, model_device)
+        attn_inputs.position_ids = positions
+
+        pre_hc = getattr(inputs, "input_hiddens", None)
+        if pre_hc is None or pre_hc.numel() == 0:
+            raise ValueError("ATOM V4 MTP forward requires target input_hiddens")
+        hc = int(self.model.args.hc_mult)
+        dim = int(self.model.args.dim)
+        expected_width = hc * dim
+        pre_hc = pre_hc.to(device=model_device, non_blocking=True).reshape(
+            pre_hc.size(0), -1
+        )
+        if pre_hc.size(0) < input_ids.numel() or pre_hc.size(1) != expected_width:
+            raise ValueError(
+                "ATOM V4 MTP hidden shape mismatch: "
+                f"got={tuple(pre_hc.shape)}, expected_rows>={input_ids.numel()}, "
+                f"expected_width={expected_width}"
+            )
+        pre_hc = pre_hc[: input_ids.numel()].view(-1, hc, dim)
+        from atom.config import use_custom_atom_config
+        from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
+
+        with use_custom_atom_config(self.model.atom_config):
+            with RTPForwardContext.bind(
+                model=self.model,
+                runtime=self,
+                inputs=inputs,
+                positions=positions,
+                layer_maps=self._rtp_layer_maps,
+                cg_max_seq_len=int(self._cg_max_seq_len),
+                cg_bufs=None,
+            ):
+                hidden_states_hc = self.model(
+                    input_ids=input_ids,
+                    positions=positions.to(dtype=torch.int64),
+                    hidden_states=pre_hc,
+                    spec_step_idx=0,
+                )
+
+        self._record_mtp_hidden_states(hidden_states_hc, attn_inputs)
+        block = self.model.model.mtp[0]
+        hidden_states = block.head.hc_head(
+            hidden_states_hc,
+            block.hc_head_fn,
+            block.hc_head_scale,
+            block.hc_head_base,
+        )
+        hidden_states = block.norm(hidden_states)
+        return PyModelOutputs(hidden_states)
+
+
 class ATOMDeepSeekV4(DeepSeekV4):
     """DeepSeek-V4 with ATOM ROCm backend.
 
@@ -1140,6 +1338,8 @@ class ATOMDeepSeekV4(DeepSeekV4):
             )
 
             self._inject_rtp_projection_weights(atom_model)
+            tp_rank = int(getattr(self.parallelism_config, "tp_rank", 0))
+            _ATOM_V4_TARGETS_BY_TP_RANK[tp_rank] = atom_model
 
         finally:
             torch.set_default_dtype(old_default_dtype)
@@ -1184,5 +1384,103 @@ class ATOMDeepSeekV4(DeepSeekV4):
 class ATOMDeepSeekV4Mtp(DeepSeekV4Mtp):
     """DeepSeek-V4 MTP draft model with ATOM ROCm backend."""
 
+    _is_external_plugin_mode = staticmethod(ATOMDeepSeekV4._is_external_plugin_mode)
+
+    def load(self, skip_python_model=False):
+        if self._is_external_plugin_mode():
+            self.device = self._get_device_str()
+            self.weight = ModelWeights(
+                num_layers=self.model_config.num_layers,
+                device=self.device,
+                dtype=self.model_config.compute_dtype,
+            )
+            self.model_weights_loader = _NoopModelWeightsLoader()
+            self.py_eplb = self.model_weights_loader._py_eplb
+            self.weight_manager = _NoopWeightManager()
+            if skip_python_model:
+                return
+            self._create_python_model()
+            logger.info("External plugin mode: ATOM V4 MTP loading complete")
+            return
+        super().load(skip_python_model=skip_python_model)
+
     def _create_python_model(self):
-        logger.warning("ATOMDeepSeekV4Mtp: MTP not yet implemented")
+        from atom.model_loader.loader import load_model_in_plugin_mode
+        from atom.plugin.prepare import prepare_model
+        from atom.plugin.rtpllm.attention_backend import apply_attention_v4_rtpllm_patch
+
+        target_device = torch.device(self.device if hasattr(self, "device") else "cuda")
+        target_dtype = self.model_config.compute_dtype
+        old_default_dtype = torch.get_default_dtype()
+        try:
+            old_default_device = torch.get_default_device()
+        except Exception:
+            old_default_device = None
+
+        torch.set_default_device(target_device)
+        if target_dtype in {torch.float16, torch.bfloat16, torch.float32}:
+            torch.set_default_dtype(target_dtype)
+
+        try:
+            atom_model = prepare_model(config=self, engine="rtpllm")
+            if atom_model is None:
+                raise ValueError("ATOM failed to create V4 MTP model")
+            apply_attention_v4_rtpllm_patch()
+            atom_model = atom_model.to(target_device)
+            atom_config = getattr(atom_model, "atom_config", None)
+            if atom_config is None:
+                raise ValueError("Cannot get atom_config from V4 MTP model")
+
+            loaded = load_model_in_plugin_mode(
+                model=atom_model,
+                config=atom_config,
+                weights_mapper=atom_model.weights_mapper,
+                spec_decode=True,
+                hf_config_override=atom_config.hf_config,
+            )
+
+            # MTP attention's grouped output projection is consumed by
+            # batched_gemm_bf16, so carrying an FP8 wo_a into forward is both
+            # unsupported and unsafe.  In this checkpoint wo_a is BF16 on disk
+            # and has no scale tensor; make_v4_quant_config(model_path=...)
+            # must therefore allocate/load it as BF16 directly.
+            for module in atom_model.modules():
+                if module.__class__.__name__ != "DeepseekV4Attention":
+                    continue
+                wo_a = getattr(module, "wo_a", None)
+                weight = getattr(wo_a, "weight", None)
+                if weight is None or weight.dtype != torch.bfloat16:
+                    raise RuntimeError(
+                        "ATOM V4 MTP wo_a must be BF16 before runtime: "
+                        f"layer={getattr(module, 'layer_name', '?')} "
+                        f"dtype={getattr(weight, 'dtype', None)} "
+                        f"has_scale={getattr(wo_a, 'weight_scale', None) is not None}"
+                    )
+
+            tp_rank = int(getattr(self.parallelism_config, "tp_rank", 0))
+            target_model = _ATOM_V4_TARGETS_BY_TP_RANK.get(tp_rank)
+            if target_model is None:
+                raise RuntimeError(
+                    "ATOM V4 MTP draft was created before its target model "
+                    f"for tp_rank={tp_rank}"
+                )
+            atom_model.share_with_target(target_model, loaded)
+            ATOMDeepSeekV4._inject_rtp_projection_weights(self, target_model)
+        finally:
+            torch.set_default_dtype(old_default_dtype)
+            if old_default_device is not None:
+                torch.set_default_device(old_default_device)
+            else:
+                torch.set_default_device("cpu")
+
+        self.py_model = _ATOMDeepSeekV4MtpRuntime(
+            model_config=self.model_config,
+            parallelism_config=self.parallelism_config,
+            weights=self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
+            atom_model=atom_model,
+        )
+        logger.info("Created ATOM DeepSeek-V4 MTP runtime for ROCm (eager mode)")

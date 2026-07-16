@@ -59,6 +59,12 @@ _INDEXER_BIND_LOGGED = False
 
 def _indexer_fp8_144_kv_requested() -> bool:
     """True iff the ROCm ATOM 144B INDEXER_KV direct-bind was requested via env."""
+    if os.environ.get("ATOM_RTPLLM_DISABLE_INDEXER_DIRECT_BIND", "0") in (
+        "1",
+        "true",
+        "True",
+    ):
+        return False
     return os.environ.get("ROCM_ATOM_DSV4_INDEXER_FP8_KV_CACHE", "0") in (
         "1",
         "true",
@@ -118,6 +124,21 @@ def _patched_sparse_attn_v4_paged_decode(
     compress_kv = getattr(attn_md, "compress_kv", None)
     swa_pages = getattr(attn_md, "swa_pages", 0)
 
+    # Triton uses q.shape[0] as its token grid and unconditionally reads
+    # kv_indptr[t:t+2].  A draft forward whose token layout does not match the
+    # metadata layout would otherwise turn this into a device-side OOB load and
+    # abort every rank.  Reject malformed metadata before launching the kernel.
+    num_tokens = int(q.shape[0])
+    expected_indptr = num_tokens + 1
+    if kv_indptr.ndim != 1 or kv_indptr.numel() != expected_indptr:
+        raise V4AttentionRuntimeError(
+            "V4 paged decode token/metadata mismatch: "
+            f"q.shape={tuple(q.shape)}, kv_indptr.shape={tuple(kv_indptr.shape)}, "
+            f"expected kv_indptr.numel()={expected_indptr}, "
+            f"kv_indices.numel()={kv_indices.numel()}, "
+            f"unified_kv.shape={tuple(unified_kv.shape)}"
+        )
+
     # --- Dual-pointer path (both graph and eager): zero-copy, zero-alloc ---
     if compress_kv is not None and compress_kv.numel() > 0 and swa_pages > 0:
         return _original_paged_decode(
@@ -157,20 +178,50 @@ def _ensure_v4_native_buffers(
     ATOM's V4 attention kernels (swa_write, compressor) work natively.
     """
     if getattr(attn_module, _V4_BUFFERS_ALLOCATED, False):
-        # Already allocated. NEVER resize — buffer addresses must remain stable
-        # for CUDA Graph replay. Prefill's large block_id indexing is handled
-        # via STATE pool gather/scatter (not by growing these buffers).
-        return
+        desired_swa = int(
+            getattr(attn_module, "_rtp_swa_stride", attn_module.window_size)
+        )
+        compressor = getattr(attn_module, "compressor", None)
+        desired_state = getattr(attn_module, "_rtp_state_stride", None)
+        indexer_comp = getattr(getattr(attn_module, "indexer", None), "compressor", None)
+        desired_indexer_state = getattr(
+            attn_module, "_rtp_indexer_state_stride", None
+        )
+        geometry_matches = attn_module.swa_kv.shape[1] == desired_swa
+        if compressor is not None and desired_state is not None:
+            geometry_matches &= compressor.kv_state.shape[1] == desired_state
+        if indexer_comp is not None and desired_indexer_state is not None:
+            geometry_matches &= (
+                indexer_comp.kv_state.shape[1] == desired_indexer_state
+            )
+        if geometry_matches:
+            # Already allocated. NEVER resize — buffer addresses must remain
+            # stable for CUDA Graph replay.
+            return
+        if os.environ.get("ENABLE_CUDA_GRAPH", "0") not in ("0", "false", "False"):
+            raise RuntimeError(
+                "RTP V4 cache geometry changed after CUDA-graph buffer allocation"
+            )
+        # Eager startup warmup can allocate the legacy non-MTP widths before a
+        # live LayerKVCache exists.  Recreate them once after geometry discovery.
+        attn_module._compact_swa_kv = None
 
     head_dim = attn_module.head_dim
     window_size = attn_module.window_size
+    # RTP-LLM adds speculative-write slack to the physical SWA ring.  Keep the
+    # model's logical attention window (window_size) separate from that ring
+    # stride; with gen_num_per_cycle=1 RTP aligns 128 + 1 to 130 entries.
+    swa_stride = int(getattr(attn_module, "_rtp_swa_stride", window_size))
     ratio = attn_module.compress_ratio
 
-    # Resize swa_kv: [num_slots, window_size, head_dim]
-    if attn_module.swa_kv.shape[0] < num_slots:
+    # Resize swa_kv: [num_slots, physical_swa_stride, head_dim]
+    if (
+        attn_module.swa_kv.shape[0] < num_slots
+        or attn_module.swa_kv.shape[1] != swa_stride
+    ):
         attn_module.swa_kv = torch.zeros(
             num_slots,
-            window_size,
+            swa_stride,
             head_dim,
             dtype=torch.bfloat16,
             device=device,
@@ -181,7 +232,7 @@ def _ensure_v4_native_buffers(
     if compressor is not None and ratio > 0:
         overlap = 1 if ratio == DSV4_CSA_RATIO else 0
         coff = 1 + overlap
-        state_dim0 = coff * ratio
+        state_dim0 = int(getattr(attn_module, "_rtp_state_stride", coff * ratio))
         state_dim1 = coff * head_dim
 
         if compressor.kv_state.shape[0] < num_slots:
@@ -219,7 +270,9 @@ def _ensure_v4_native_buffers(
         if idx_compressor is not None:
             csa_overlap = 1  # CSA always has overlap
             idx_coff = 1 + csa_overlap
-            idx_state_dim0 = idx_coff * ratio
+            idx_state_dim0 = int(
+                getattr(attn_module, "_rtp_indexer_state_stride", idx_coff * ratio)
+            )
             idx_state_dim1 = idx_coff * idx_head_dim
             if idx_compressor.kv_state.shape[0] < num_slots:
                 idx_compressor.kv_state = torch.zeros(
@@ -250,7 +303,7 @@ def _ensure_v4_native_buffers(
             )
 
     # unified_kv: SWA-only view (compress region added via pool bind if available)
-    swa_pages = num_slots * window_size
+    swa_pages = num_slots * swa_stride
     attn_module.unified_kv = torch.zeros(
         swa_pages,
         head_dim,
@@ -321,15 +374,43 @@ def _bind_v4_kv_cache_views(
     ratio = attn_module.compress_ratio
     window_size = attn_module.window_size
 
-    # SWA_KV: [B, 131072] uint8 → [B, 128, 512] bf16
+    # SWA_KV: [B, stride_bytes] uint8 → [B, physical_stride, 512] bf16.
+    # physical_stride is 128 without speculative decoding and 130 for MTP=1
+    # (RTP's state-ring geometry is even-aligned).  Inferring it from the live
+    # pool keeps this bridge in sync with the C++ allocator.
     swa_pool = layer_pools.get("SWA_KV")
     if swa_pool is not None:
         raw = swa_pool.kv_cache_base
         B = raw.shape[0]
         swa_bf16 = raw.view(torch.bfloat16)
-        swa_kv = swa_bf16.reshape(B, window_size, head_dim)
+        elems_per_block = swa_bf16.numel() // B
+        if elems_per_block % head_dim != 0:
+            raise ValueError(
+                "invalid RTP SWA_KV geometry: "
+                f"elems_per_block={elems_per_block} head_dim={head_dim}"
+            )
+        swa_stride = elems_per_block // head_dim
+        if swa_stride < window_size:
+            raise ValueError(
+                "RTP SWA_KV physical stride is smaller than the logical window: "
+                f"stride={swa_stride} window={window_size}"
+            )
+        attn_module._rtp_swa_stride = swa_stride
+        swa_kv = swa_bf16.reshape(B, swa_stride, head_dim)
         attn_module.swa_kv = swa_kv
         swa_flat = swa_bf16.reshape(-1, head_dim)
+
+        # Eager decode uses a compact per-request ring.  It may have been
+        # allocated before the first real pool bind using the non-MTP width.
+        compact = getattr(attn_module, "_compact_swa_kv", None)
+        if compact is not None and compact.shape[1] != swa_stride:
+            attn_module._compact_swa_kv = torch.zeros(
+                compact.shape[0],
+                swa_stride,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=raw.device,
+            )
     else:
         device = next(attn_module.parameters()).device
         swa_flat = torch.zeros(1, head_dim, dtype=torch.bfloat16, device=device)
@@ -359,6 +440,77 @@ def _bind_v4_kv_cache_views(
 
     attn_module._rtp_compress_kv = compress_kv
     attn_module._rtp_swa_pages = swa_flat.shape[0]
+
+
+def _set_v4_swa_geometry_from_cache(attn_module: Any, kv_cache_data: Any) -> None:
+    """Publish SWA geometry before per-forward metadata is constructed.
+
+    Metadata is built before the layer's pool tensors are bound on the prefill
+    path.  Reading tensor shape metadata here avoids one forward being built
+    with the legacy 128 stride before `_bind_v4_kv_cache_views` discovers 130.
+    """
+    if not kv_cache_data:
+        return
+    cache_entry = kv_cache_data.get(f"layer_{attn_module.layer_id}")
+    layer_pools = getattr(cache_entry, "k_cache", None)
+    if not isinstance(layer_pools, dict):
+        return
+    swa_pool = layer_pools.get("SWA_KV")
+    raw = getattr(swa_pool, "kv_cache_base", None)
+    if raw is None or raw.dim() < 1 or raw.shape[0] <= 0:
+        return
+    num_blocks = int(raw.shape[0])
+    bytes_per_block = (raw.numel() // num_blocks) * raw.element_size()
+    entry_bytes = int(attn_module.head_dim) * torch.bfloat16.itemsize
+    if bytes_per_block % entry_bytes != 0:
+        raise ValueError(
+            "invalid RTP SWA_KV byte geometry: "
+            f"bytes_per_block={bytes_per_block} entry_bytes={entry_bytes}"
+        )
+    swa_stride = bytes_per_block // entry_bytes
+    if swa_stride < int(attn_module.window_size):
+        raise ValueError(
+            "RTP SWA_KV physical stride is smaller than the logical window: "
+            f"stride={swa_stride} window={attn_module.window_size}"
+        )
+    attn_module._rtp_swa_stride = swa_stride
+    attn_module._rtp_swa_pages = num_blocks * swa_stride
+
+    # Compressor state rings carry the same speculative slack.  RTP stores
+    # [kv_state, score_state] as fp32 in each STATE block, so derive the ring
+    # width from bytes rather than duplicating C++ alignment rules here.
+    ratio = int(attn_module.compress_ratio)
+    if ratio <= 0:
+        return
+    overlap = 1 if ratio == DSV4_CSA_RATIO else 0
+    state_dim = (1 + overlap) * int(attn_module.head_dim)
+
+    def _state_stride(region_name: str, dim: int):
+        pool = layer_pools.get(region_name)
+        base = getattr(pool, "kv_cache_base", None)
+        if base is None or base.dim() < 1 or base.shape[0] <= 0:
+            return None
+        blocks = int(base.shape[0])
+        bytes_per_state_block = (base.numel() // blocks) * base.element_size()
+        denom = 2 * dim * torch.float32.itemsize
+        if bytes_per_state_block % denom != 0:
+            raise ValueError(
+                f"invalid RTP {region_name} geometry: "
+                f"bytes_per_block={bytes_per_state_block} state_dim={dim}"
+            )
+        return bytes_per_state_block // denom
+
+    main_region = "CSA_STATE" if ratio == DSV4_CSA_RATIO else "HCA_STATE"
+    main_stride = _state_stride(main_region, state_dim)
+    if main_stride is not None:
+        attn_module._rtp_state_stride = main_stride
+
+    if ratio == DSV4_CSA_RATIO:
+        indexer = getattr(attn_module, "indexer", None)
+        idx_head_dim = int(getattr(indexer, "head_dim", attn_module.head_dim))
+        idx_stride = _state_stride("INDEXER_STATE", 2 * idx_head_dim)
+        if idx_stride is not None:
+            attn_module._rtp_indexer_state_stride = idx_stride
 
 
 def _bind_v4_compressor_views(
@@ -569,23 +721,22 @@ def _bind_v4_indexer_views(
         )
         indexer._rtp_idx_kv_shadow = shadow_kv
 
-    # Bind kv_cache for both Indexer and its inner Compressor
-    indexer.kv_cache = shadow_kv
-
     global _INDEXER_BIND_LOGGED
-    if not _INDEXER_BIND_LOGGED and _indexer_fp8_144_kv_requested():
-        # env requested the 144B direct-bind but we fell back to the shadow —
-        # an unexpected degradation worth one WARNING. When the env is NOT set,
-        # shadow is the intended path, so stay silent (no false alarm).
-        logger.warning(
-            "V4 INDEXER_KV requested 144B direct-bind but FELL BACK to shadow "
-            "(binding=shadow_fallback) first_layer=%s blocks=%d entries_per_block=%d "
-            "— check INDEXER_KV pool layout / global fp8_kv_cache",
+    if not _INDEXER_BIND_LOGGED:
+        logger.info(
+            "V4 INDEXER_KV shadow bind ACTIVE (binding=atom_fp8_shadow) "
+            "first_layer=%s blocks=%d entries_per_block=%d entry_bytes=%d "
+            "direct_requested=%d",
             getattr(attn_module, "layer_id", "?"),
             NB,
             k1,
+            aligned_dim,
+            int(_indexer_fp8_144_kv_requested()),
         )
         _INDEXER_BIND_LOGGED = True
+
+    # Bind kv_cache for both Indexer and its inner Compressor
+    indexer.kv_cache = shadow_kv
 
     idx_compressor = getattr(indexer, "compressor", None)
     if idx_compressor is not None:
@@ -1067,6 +1218,7 @@ def _patched_v4_forward(self, x, positions):
         )
     if not getattr(attn_md, _V4_META_BUILT_ATTR, False):
         try:
+            _set_v4_swa_geometry_from_cache(self, fc.kv_cache_data)
             rtp_attn_inputs = getattr(attn_md, "rtp_attn_inputs", None)
             if rtp_attn_inputs is None:
                 rtp_attn_inputs = getattr(attn_md, "plugin_metadata", None)
@@ -1087,7 +1239,10 @@ def _patched_v4_forward(self, x, positions):
 
             # DECODE: use Triton kernels for index construction (same as graph mode)
             _is_eager_prefill = bool(getattr(rtp_attn_inputs, "is_prefill", True))
-            if not _is_eager_prefill:
+            _is_target_verify = bool(
+                getattr(rtp_attn_inputs, "is_target_verify", False)
+            )
+            if not _is_eager_prefill and not _is_target_verify:
                 _triton_ok = _build_eager_decode_with_triton(
                     attn_md,
                     rtp_attn_inputs,
@@ -1096,6 +1251,7 @@ def _patched_v4_forward(self, x, positions):
                     region_to_group,
                     x.device,
                     window_size=self.window_size,
+                    swa_stride=getattr(self, "_rtp_swa_stride", self.window_size),
                     pool_swa_pages=getattr(self, "_rtp_swa_pages", 0),
                     index_topk=attn_md._index_topk,
                 )
@@ -1114,7 +1270,9 @@ def _patched_v4_forward(self, x, positions):
                         f"eager decode metadata build failed for layer {self.layer_id}",
                     )
             else:
-                # PREFILL: use original CPU metadata construction
+                # Prefill and multi-token target verification use the general
+                # ragged metadata builder.  The decode Triton fast path is
+                # intentionally one-token-per-request only.
                 _build_v4_per_forward_metadata(
                     attn_md,
                     rtp_attn_inputs,
@@ -1123,6 +1281,7 @@ def _patched_v4_forward(self, x, positions):
                     region_to_group,
                     x.device,
                     window_size=self.window_size,
+                    swa_stride=getattr(self, "_rtp_swa_stride", self.window_size),
                     pool_swa_pages=getattr(self, "_rtp_swa_pages", 0),
                 )
         except Exception as e:
@@ -1152,7 +1311,6 @@ def _patched_v4_forward(self, x, positions):
     if _triton_block_ids is not None:
         active_bs = int(getattr(attn_md, "_eager_triton_active_bs", 0))
         swa_pages_val = int(getattr(attn_md, "_eager_triton_swa_pages", 0))
-
         kv_cache_data = fc.kv_cache_data
         try:
             cache_entry = _prepare_v4_decode_layer_storage(
@@ -1206,15 +1364,30 @@ def _patched_v4_forward(self, x, positions):
         _pos_cpu = getattr(attn_md, "_eager_swa_positions_cpu", None)
         if _pool_swa is not None and _bt_cpu is not None and _pos_cpu is not None:
             _win = int(self.window_size)
-            _prev = getattr(self, "_eager_prev_seed_pos", None)
             _cur = [int(p) for p in _pos_cpu]
-            if _prev is None:
+            _cu_cpu = attn_md.cu_seqlens_q.detach().cpu().tolist()
+            _cur_q = [
+                int(_cu_cpu[i + 1] - _cu_cpu[i]) for i in range(len(_cur))
+            ]
+            _prev_spans = getattr(self, "_eager_prev_seed_spans", None)
+            if _prev_spans is None:
                 _seed = [True] * len(_cur)
             else:
                 _seed = [
-                    (i >= len(_prev)) or (c != _prev[i] + 1) for i, c in enumerate(_cur)
+                    (i >= len(_prev_spans))
+                    or not (
+                        _prev_spans[i][0] < c
+                        <= _prev_spans[i][0] + _prev_spans[i][1]
+                    )
+                    for i, c in enumerate(_cur)
                 ]
-            self._eager_prev_seed_pos = _cur
+            # A speculative span with q_len=2 may advance by either one or two
+            # accepted tokens. Both starts are continuous with the compact ring
+            # just written. Treating only start+1 as continuous caused an
+            # unnecessary pool reseed on accept_len=2; for long contexts those
+            # compact rows are intentionally not scattered to col0, so the
+            # reseed restored stale data and corrupted the next verification.
+            self._eager_prev_seed_spans = list(zip(_cur, _cur_q))
             _cols = _bt_cpu.shape[1]
             _npool = _pool_swa.shape[0]
             for _si in range(len(_cur)):
@@ -1407,7 +1580,11 @@ def _patched_v4_forward(self, x, positions):
             _sp = _saved_unified.shape[0]
             _full = torch.cat([_saved_unified, _compress_kv], dim=0)
             self.unified_kv = _full
-            self.swa_kv = _full[:_sp].reshape(-1, self.window_size, self.head_dim)
+            self.swa_kv = _full[:_sp].reshape(
+                -1,
+                int(getattr(self, "_rtp_swa_stride", self.window_size)),
+                self.head_dim,
+            )
             _comp = getattr(self, "compressor", None)
             if _comp is not None:
                 _saved_comp_kv = _comp.kv_cache

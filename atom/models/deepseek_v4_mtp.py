@@ -114,10 +114,18 @@ class MTPBlock(Block):
         step (mtp_k > 1) without re-expanding from a `[N, dim]` post-reduction
         state.
         """
-        assert (
-            self.embed is not None
-        ), "MTPBlock requires .embed to be assigned by the wrapper"
-        e = self.enorm(self.embed(input_ids))  # [num_tokens, dim]
+        assert self.embed is not None, (
+            "MTPBlock requires .embed to be assigned by the wrapper"
+        )
+        token_embeddings = self.embed(input_ids)
+        # DeepSeek-V4 uses position 0 as the initial MTP mask step.  Suppress
+        # that token embedding to match the reference/native RTP model.
+        token_embeddings = torch.where(
+            positions.reshape(-1, 1) == 0,
+            torch.zeros_like(token_embeddings),
+            token_embeddings,
+        )
+        e = self.enorm(token_embeddings)  # [num_tokens, dim]
         x = self.hnorm(x)  # [num_tokens, hc, dim]
         # Mix token-embed + hidden into a fresh residual. h_proj is FP8
         # (V4QuantConfig → ReplicatedLinear over `gemm_a8w8_blockscale_preshuffle`),
@@ -216,17 +224,24 @@ class DeepseekV4MTP(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config: Config, prefix: str = "") -> None:
+    def __init__(self, atom_config: Config, prefix: str = "") -> None:
         super().__init__()
-        self.atom_config = config
-        self.hf_config = config.hf_config
+        self.atom_config = atom_config
+        self.hf_config = atom_config.hf_config
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
         self.args.quant_config = make_v4_quant_config(
             self.hf_config,
-            online_quant_config=getattr(config, "online_quant_config", None),
+            # V4 checkpoints can advertise an FP8 model globally while storing
+            # wo_a as BF16 (and no matching scale tensor) in the actual shard.
+            # The target passes model_path so make_v4_quant_config can inspect
+            # the checkpoint and allocate BF16 wo_a directly.  The draft must
+            # do the same; otherwise it allocates FP8 + an uninitialized scale,
+            # then post-load dequantizes the real BF16 weight with junk scale.
+            model_path=getattr(atom_config, "model", None),
+            online_quant_config=getattr(atom_config, "online_quant_config", None),
         )
         self.atom_config.quant_config = self.args.quant_config
-        self.model = DeepseekV4MTPModel(atom_config=config, args=self.args)
+        self.model = DeepseekV4MTPModel(atom_config=atom_config, args=self.args)
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Filter loader input to MTP-only weights.

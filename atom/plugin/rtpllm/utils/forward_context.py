@@ -1650,7 +1650,12 @@ class RTPForwardContext:
             raise ValueError("RTP plugin failed to derive non-zero batch size.")
         context = Context(
             positions=positions,
-            is_prefill=bool(getattr(attn_inputs, "is_prefill", False)),
+            # RTP target verification clears sequence_lengths, so its generic
+            # boundary flag says prefill even though the operation is a
+            # multi-token decode.  ATOM operators must use decode cache/state
+            # semantics for this case.
+            is_prefill=bool(getattr(attn_inputs, "is_prefill", False))
+            and not bool(getattr(attn_inputs, "is_target_verify", False)),
             batch_size=batch_size,
             graph_bs=batch_size,
         )

@@ -32,6 +32,16 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
         pass
 
     fake_atom_glm_mod.ATOMGlm5Moe = _FakeATOMGlm5Moe
+    fake_atom_v4_mod = ModuleType("atom.plugin.rtpllm.models.deepseek_v4")
+
+    class _FakeATOMDeepSeekV4:
+        pass
+
+    class _FakeATOMDeepSeekV4Mtp:
+        pass
+
+    fake_atom_v4_mod.ATOMDeepSeekV4 = _FakeATOMDeepSeekV4
+    fake_atom_v4_mod.ATOMDeepSeekV4Mtp = _FakeATOMDeepSeekV4Mtp
 
     fake_modules = {
         "rtp_llm": _package("rtp_llm"),
@@ -39,6 +49,7 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
         "rtp_llm.model_factory_register": fake_register_mod,
         "atom.plugin.rtpllm.models.qwen3_5": fake_atom_qwen_mod,
         "atom.plugin.rtpllm.models.glm5": fake_atom_glm_mod,
+        "atom.plugin.rtpllm.models.deepseek_v4": fake_atom_v4_mod,
     }
 
     with patch.dict(sys.modules, fake_modules):
@@ -53,10 +64,21 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
             ]
             == "qwen35_moe"
         )
+        assert (
+            fake_register_mod._model_factory["deepseek_v4_mtp"]
+            is _FakeATOMDeepSeekV4Mtp
+        )
+        assert (
+            fake_register_mod._hf_architecture_2_ft[
+                "DeepseekV4ForCausalLMNextN"
+            ]
+            == "deepseek_v4_mtp"
+        )
         register_model_mock.assert_has_calls(
             [
                 call("atom_qwen35_moe", _FakeATOMQwen35Moe, []),
                 call("atom_glm5_moe", _FakeATOMGlm5Moe, []),
+                call("atom_deepseek_v4", _FakeATOMDeepSeekV4, []),
             ],
             any_order=False,
         )
