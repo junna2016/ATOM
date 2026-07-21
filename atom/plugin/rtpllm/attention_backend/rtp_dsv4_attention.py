@@ -872,6 +872,42 @@ def _v4_decode_swa_scatter(attn_module, pool_swa, block_ids, active_bs, rows=Non
     pool_swa.index_copy_(0, selected_ids, attn_module.swa_kv.index_select(0, rows))
 
 
+def _v4_decode_swa_token_scatter(
+    attn_module, pool_swa, block_ids, token_offsets, active_bs
+):
+    """Persist this eager decode step's new SWA rows to physical tail blocks."""
+    if pool_swa is None or block_ids is None or token_offsets is None or active_bs <= 0:
+        return
+    rows = torch.arange(active_bs, dtype=torch.int64, device=pool_swa.device)
+    blocks = block_ids[:active_bs]
+    offsets = token_offsets[:active_bs]
+    values = attn_module.swa_kv[rows, offsets]
+    flat_ids = blocks * int(pool_swa.shape[1]) + offsets
+    pool_swa.view(-1, pool_swa.shape[-1]).index_copy_(0, flat_ids, values)
+
+
+def _v4_eager_seed_mask(
+    current_positions,
+    current_blocks,
+    previous_spans,
+    previous_blocks,
+):
+    """Identify eager slots that no longer contain the same request state."""
+    if previous_spans is None or previous_blocks is None:
+        return [True] * len(current_positions)
+    return [
+        (i >= len(previous_spans))
+        or (i >= len(previous_blocks))
+        or (current_blocks[i] != previous_blocks[i])
+        or not (
+            previous_spans[i][0]
+            < position
+            <= previous_spans[i][0] + previous_spans[i][1]
+        )
+        for i, position in enumerate(current_positions)
+    ]
+
+
 def _v4_region_block_table(v4_block_tables, ratio):
     """Return the main KV block table for one V4 attention layer type."""
     if ratio == 0:
@@ -1362,22 +1398,21 @@ def _patched_v4_forward(self, x, positions):
         # so continuing requests keep their maintained ring.
         _bt_cpu = getattr(attn_md, "_eager_swa_bt_cpu", None)
         _pos_cpu = getattr(attn_md, "_eager_swa_positions_cpu", None)
-        if _pool_swa is not None and _bt_cpu is not None and _pos_cpu is not None:
+        _write_blocks_cpu = getattr(attn_md, "_eager_swa_write_blocks_cpu", None)
+        if (
+            _pool_swa is not None
+            and _bt_cpu is not None
+            and _pos_cpu is not None
+            and _write_blocks_cpu is not None
+        ):
             _win = int(self.window_size)
             _cur = [int(p) for p in _pos_cpu]
+            _cur_blocks = [int(block) for block in _write_blocks_cpu]
             _cu_cpu = attn_md.cu_seqlens_q.detach().cpu().tolist()
             _cur_q = [int(_cu_cpu[i + 1] - _cu_cpu[i]) for i in range(len(_cur))]
             _prev_spans = getattr(self, "_eager_prev_seed_spans", None)
-            if _prev_spans is None:
-                _seed = [True] * len(_cur)
-            else:
-                _seed = [
-                    (i >= len(_prev_spans))
-                    or not (
-                        _prev_spans[i][0] < c <= _prev_spans[i][0] + _prev_spans[i][1]
-                    )
-                    for i, c in enumerate(_cur)
-                ]
+            _prev_blocks = getattr(self, "_eager_prev_seed_blocks", None)
+            _seed = _v4_eager_seed_mask(_cur, _cur_blocks, _prev_spans, _prev_blocks)
             # A speculative span with q_len=2 may advance by either one or two
             # accepted tokens. Both starts are continuous with the compact ring
             # just written. Treating only start+1 as continuous caused an
@@ -1385,6 +1420,7 @@ def _patched_v4_forward(self, x, positions):
             # compact rows are intentionally not scattered to col0, so the
             # reseed restored stale data and corrupted the next verification.
             self._eager_prev_seed_spans = list(zip(_cur, _cur_q))
+            self._eager_prev_seed_blocks = _cur_blocks
             _cols = _bt_cpu.shape[1]
             _npool = _pool_swa.shape[0]
             for _si in range(len(_cur)):
@@ -1435,6 +1471,19 @@ def _patched_v4_forward(self, x, positions):
                 f"eager attention forward failed for layer {self.layer_id} ratio {ratio}",
                 e,
             )
+
+        # Long requests do not scatter their whole compact ring through col0,
+        # because col0 is stale/freed after the sliding-window boundary. Still
+        # persist the single row written by this step to its real tail block;
+        # otherwise a later batch-slot move can only reseed from stale prefill
+        # data and loses all generated-token history.
+        _v4_decode_swa_token_scatter(
+            self,
+            _pool_swa,
+            getattr(attn_md, "_eager_swa_write_blocks", None),
+            getattr(attn_md, "_eager_swa_write_offsets", None),
+            active_bs,
+        )
 
         # --- Scatter: compact → pool, ONLY for valid-col0 rows ---
         # Skipping freed-col0 rows also avoids polluting physical block 0 (the

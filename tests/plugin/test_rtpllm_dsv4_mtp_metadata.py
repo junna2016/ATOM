@@ -173,3 +173,47 @@ def test_paged_decode_rejects_undersized_indptr_buffer():
                 torch.empty(1),
                 1.0,
             )
+
+
+def test_eager_swa_token_scatter_persists_only_current_rows():
+    module = SimpleNamespace(
+        swa_kv=torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    )
+    pool = torch.zeros(5, 4, 3)
+
+    attention._v4_decode_swa_token_scatter(
+        module,
+        pool,
+        block_ids=torch.tensor([3, 1], dtype=torch.int64),
+        token_offsets=torch.tensor([2, 0], dtype=torch.int64),
+        active_bs=2,
+    )
+
+    assert torch.equal(pool[3, 2], module.swa_kv[0, 2])
+    assert torch.equal(pool[1, 0], module.swa_kv[1, 0])
+    assert torch.count_nonzero(pool).item() == 6
+
+
+def test_eager_swa_write_targets_use_current_tail_block_and_ring_offset():
+    blocks, offsets = metadata._eager_swa_write_targets(
+        swa_bt_cpu=torch.tensor(
+            [[-1, 11, 12, 13], [-1, 21, 22, 23]], dtype=torch.int32
+        ).numpy(),
+        positions=torch.tensor([290, 383], dtype=torch.int32).numpy(),
+        window_size=128,
+        cache_size=130,
+    )
+
+    assert blocks.tolist() == [12, 22]
+    assert offsets.tolist() == [30, 123]
+
+
+def test_eager_seed_mask_detects_batch_slot_request_change():
+    mask = attention._v4_eager_seed_mask(
+        current_positions=[301, 301],
+        current_blocks=[17, 29],
+        previous_spans=[(300, 1), (300, 1)],
+        previous_blocks=[17, 23],
+    )
+
+    assert mask == [False, True]

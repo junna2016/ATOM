@@ -30,6 +30,21 @@ from atom.plugin.rtpllm.attention_backend.rtp_dsv4_spec import (
 logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.rtp_dsv4_metadata")
 
 
+def _eager_swa_write_targets(swa_bt_cpu, positions, window_size, cache_size):
+    """Map eager decode positions to persistent RTP SWA block/row targets."""
+    if swa_bt_cpu.ndim != 2 or swa_bt_cpu.shape[1] == 0:
+        raise ValueError(f"invalid V4 eager SWA block table: {swa_bt_cpu.shape}")
+    write_cols = np.minimum(positions // window_size, swa_bt_cpu.shape[1] - 1)
+    write_blocks = swa_bt_cpu[np.arange(len(positions)), write_cols].astype(np.int64)
+    if np.any(write_blocks < 0):
+        raise ValueError(
+            "V4 eager decode current SWA block is not allocated: "
+            f"positions={positions.tolist()} blocks={write_blocks.tolist()}"
+        )
+    write_offsets = (positions % cache_size).astype(np.int64)
+    return write_blocks, write_offsets
+
+
 def _forward_mode(attn_inputs, bs):
     """Classify RTP's overloaded ``is_prefill`` flag for V4.
 
@@ -306,9 +321,28 @@ def _build_eager_decode_with_triton(
     # col0-only gather above skips. Without this a long-prompt slot's compact ring
     # is never seeded and serves stale / cross-request data (bs>1 contamination).
     if swa_bt is not None and swa_bt.numel() >= bs:
-        attn_md._eager_swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+        swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
+        attn_md._eager_swa_bt_cpu = swa_bt_cpu
+
+        # The compact ring is indexed by the transient eager batch slot, while
+        # RTP owns persistent SWA blocks. Persist each decoded token into the
+        # physical tail block that covers its absolute position so a request
+        # can be reconstructed after batch compaction moves it to another slot.
+        write_blocks_np, write_offsets_np = _eager_swa_write_targets(
+            swa_bt_cpu, positions_np[:bs], win, cs
+        )
+        attn_md._eager_swa_write_blocks = torch.from_numpy(write_blocks_np).to(
+            device=device
+        )
+        attn_md._eager_swa_write_offsets = torch.from_numpy(write_offsets_np).to(
+            device=device
+        )
+        attn_md._eager_swa_write_blocks_cpu = write_blocks_np.copy()
     else:
         attn_md._eager_swa_bt_cpu = None
+        attn_md._eager_swa_write_blocks = None
+        attn_md._eager_swa_write_offsets = None
+        attn_md._eager_swa_write_blocks_cpu = None
     attn_md._eager_swa_positions_cpu = positions_np[:bs].copy()
 
     setattr(attn_md, _V4_META_BUILT_ATTR, True)
@@ -461,9 +495,7 @@ def _build_v4_per_forward_metadata(
                 .max(dim=1)
                 .values.clamp(min=0)
             )
-            _cur_block = _raw.gather(
-                1, _last_valid_col.long().unsqueeze(1)
-            ).squeeze(1)
+            _cur_block = _raw.gather(1, _last_valid_col.long().unsqueeze(1)).squeeze(1)
             _col0 = swa_bt[:bs, 0]
             _ssm = (
                 torch.where(_col0 >= 0, _col0, _cur_block)
@@ -486,9 +518,9 @@ def _build_v4_per_forward_metadata(
             decode_swa_block_ids_raw_np = (
                 swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
             )
-            decode_swa_block_ids_np = np.maximum(
-                decode_swa_block_ids_raw_np, 0
-            ).astype(np.int64)
+            decode_swa_block_ids_np = np.maximum(decode_swa_block_ids_raw_np, 0).astype(
+                np.int64
+            )
         attn_md.state_slot_mapping = _ssm
         attn_md.state_slot_mapping_cpu = attn_md.state_slot_mapping.cpu().numpy().copy()
     else:
@@ -602,9 +634,9 @@ def _build_v4_per_forward_metadata(
         if decode_swa_block_ids_np is None:
             decode_swa_block_ids_np = np.arange(bs, dtype=np.int64)
             decode_swa_block_ids_raw_np = decode_swa_block_ids_np.astype(np.int32)
-        attn_md._eager_triton_block_ids = torch.from_numpy(
-            decode_swa_block_ids_np
-        ).to(device=device, dtype=torch.int64)
+        attn_md._eager_triton_block_ids = torch.from_numpy(decode_swa_block_ids_np).to(
+            device=device, dtype=torch.int64
+        )
         attn_md._eager_triton_active_bs = bs
         attn_md._eager_triton_swa_pages = int(attn_md.swa_pages)
 
