@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 # The shared test conftest replaces atom.plugin.rtpllm.utils dependencies with
@@ -14,13 +15,7 @@ import torch
 # the full RTP forward-context stack.
 _utils_package = types.ModuleType("atom.plugin.rtpllm.utils")
 _utils_package.__path__ = [
-    str(
-        Path(__file__).resolve().parents[2]
-        / "atom"
-        / "plugin"
-        / "rtpllm"
-        / "utils"
-    )
+    str(Path(__file__).resolve().parents[2] / "atom" / "plugin" / "rtpllm" / "utils")
 ]
 
 
@@ -34,6 +29,9 @@ with mock.patch.dict(
 ):
     metadata = importlib.import_module(
         "atom.plugin.rtpllm.attention_backend.rtp_dsv4_metadata"
+    )
+    attention = importlib.import_module(
+        "atom.plugin.rtpllm.attention_backend.rtp_dsv4_attention"
     )
     SWA_KV = importlib.import_module(
         "atom.plugin.rtpllm.utils.v4_kv_cache_bridge"
@@ -117,3 +115,61 @@ def test_fresh_prefill_keeps_physical_pool_slot():
     assert md.state is _AttnState.PREFILL_NATIVE
     assert md.state_slot_mapping.tolist() == [7]
     assert not hasattr(md, "_eager_triton_block_ids")
+
+
+def _call_paged_decode(*, num_tokens: int, indptr_capacity: int):
+    q = torch.empty(num_tokens, 2, 8)
+    unified_kv = torch.empty(64, 8)
+    kv_indices = torch.empty(128, dtype=torch.int32)
+    kv_indptr = torch.empty(indptr_capacity, dtype=torch.int32)
+    attn_md = SimpleNamespace(compress_kv=None, swa_pages=0)
+    forward_context = SimpleNamespace(attn_metadata=attn_md)
+    sentinel = object()
+
+    with (
+        mock.patch.object(
+            sys.modules["atom.utils.forward_context"],
+            "get_forward_context",
+            return_value=forward_context,
+            create=True,
+        ),
+        mock.patch.object(attention, "_original_paged_decode", return_value=sentinel),
+    ):
+        result = attention._patched_sparse_attn_v4_paged_decode(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            torch.empty(1),
+            1.0,
+        )
+    return result, sentinel
+
+
+def test_paged_decode_accepts_max_batch_graph_indptr_buffer():
+    # A bs=24 graph bucket reuses metadata allocated for max_bs=32.
+    result, sentinel = _call_paged_decode(num_tokens=24, indptr_capacity=33)
+    assert result is sentinel
+
+
+def test_paged_decode_rejects_undersized_indptr_buffer():
+    with mock.patch.object(
+        sys.modules["atom.utils.forward_context"],
+        "get_forward_context",
+        return_value=SimpleNamespace(
+            attn_metadata=SimpleNamespace(compress_kv=None, swa_pages=0)
+        ),
+        create=True,
+    ):
+        with pytest.raises(
+            attention.V4AttentionRuntimeError,
+            match=r"required kv_indptr.numel\(\)>=25",
+        ):
+            attention._patched_sparse_attn_v4_paged_decode(
+                torch.empty(24, 2, 8),
+                torch.empty(64, 8),
+                torch.empty(128, dtype=torch.int32),
+                torch.empty(24, dtype=torch.int32),
+                torch.empty(1),
+                1.0,
+            )

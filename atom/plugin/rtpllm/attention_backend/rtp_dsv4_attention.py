@@ -125,16 +125,18 @@ def _patched_sparse_attn_v4_paged_decode(
     swa_pages = getattr(attn_md, "swa_pages", 0)
 
     # Triton uses q.shape[0] as its token grid and unconditionally reads
-    # kv_indptr[t:t+2].  A draft forward whose token layout does not match the
-    # metadata layout would otherwise turn this into a device-side OOB load and
-    # abort every rank.  Reject malformed metadata before launching the kernel.
+    # kv_indptr[t:t+2]. A draft forward whose token layout does not match the
+    # metadata capacity would otherwise turn this into a device-side OOB load
+    # and abort every rank. CUDA Graph indptr buffers are deliberately sized to
+    # the runner's max batch size, so a smaller capture bucket may legitimately
+    # pass a longer buffer. Only reject buffers that cannot cover every q row.
     num_tokens = int(q.shape[0])
-    expected_indptr = num_tokens + 1
-    if kv_indptr.ndim != 1 or kv_indptr.numel() != expected_indptr:
+    min_indptr = num_tokens + 1
+    if kv_indptr.ndim != 1 or kv_indptr.numel() < min_indptr:
         raise V4AttentionRuntimeError(
             "V4 paged decode token/metadata mismatch: "
             f"q.shape={tuple(q.shape)}, kv_indptr.shape={tuple(kv_indptr.shape)}, "
-            f"expected kv_indptr.numel()={expected_indptr}, "
+            f"required kv_indptr.numel()>={min_indptr}, "
             f"kv_indices.numel()={kv_indices.numel()}, "
             f"unified_kv.shape={tuple(unified_kv.shape)}"
         )
@@ -183,17 +185,15 @@ def _ensure_v4_native_buffers(
         )
         compressor = getattr(attn_module, "compressor", None)
         desired_state = getattr(attn_module, "_rtp_state_stride", None)
-        indexer_comp = getattr(getattr(attn_module, "indexer", None), "compressor", None)
-        desired_indexer_state = getattr(
-            attn_module, "_rtp_indexer_state_stride", None
+        indexer_comp = getattr(
+            getattr(attn_module, "indexer", None), "compressor", None
         )
+        desired_indexer_state = getattr(attn_module, "_rtp_indexer_state_stride", None)
         geometry_matches = attn_module.swa_kv.shape[1] == desired_swa
         if compressor is not None and desired_state is not None:
             geometry_matches &= compressor.kv_state.shape[1] == desired_state
         if indexer_comp is not None and desired_indexer_state is not None:
-            geometry_matches &= (
-                indexer_comp.kv_state.shape[1] == desired_indexer_state
-            )
+            geometry_matches &= indexer_comp.kv_state.shape[1] == desired_indexer_state
         if geometry_matches:
             # Already allocated. NEVER resize — buffer addresses must remain
             # stable for CUDA Graph replay.
@@ -1366,9 +1366,7 @@ def _patched_v4_forward(self, x, positions):
             _win = int(self.window_size)
             _cur = [int(p) for p in _pos_cpu]
             _cu_cpu = attn_md.cu_seqlens_q.detach().cpu().tolist()
-            _cur_q = [
-                int(_cu_cpu[i + 1] - _cu_cpu[i]) for i in range(len(_cur))
-            ]
+            _cur_q = [int(_cu_cpu[i + 1] - _cu_cpu[i]) for i in range(len(_cur))]
             _prev_spans = getattr(self, "_eager_prev_seed_spans", None)
             if _prev_spans is None:
                 _seed = [True] * len(_cur)
@@ -1376,8 +1374,7 @@ def _patched_v4_forward(self, x, positions):
                 _seed = [
                     (i >= len(_prev_spans))
                     or not (
-                        _prev_spans[i][0] < c
-                        <= _prev_spans[i][0] + _prev_spans[i][1]
+                        _prev_spans[i][0] < c <= _prev_spans[i][0] + _prev_spans[i][1]
                     )
                     for i, c in enumerate(_cur)
                 ]
