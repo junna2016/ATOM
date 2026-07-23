@@ -1179,11 +1179,6 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
     # state_slot_mapping_cpu (numpy) needed by compressor internals
     attn_md.state_slot_mapping_cpu = bufs.get("_state_slot_mapping_cpu")
 
-    # --- Gather: pool[block_ids] → compact swa_kv[0..bs-1] ---
-    _block_ids = bufs.get("_block_ids")
-    _pool_swa = getattr(self, "_rtp_pool_swa_kv", None)
-    _v4_decode_swa_gather(self, _pool_swa, _block_ids, active_bs)
-
     # --- STATE pool gather: pool → compact kv_state/score_state ---
     _state_pool_view_g, _state_block_ids_g = _v4_decode_state_gather(
         self, ratio, active_bs, v4_block_tables, cache_entry
@@ -1208,9 +1203,9 @@ def _v4_forward_cuda_graph(self, x, positions, fc, attn_md):
             e,
         )
 
-    # --- Scatter: compact → pool ---
-    _v4_decode_swa_scatter(self, _pool_swa, _block_ids, active_bs)
-    # STATE scatter
+    # SWA stays compact and self-maintaining across graph replays. The next
+    # prepare_cuda_graph call persists this step's single new row to RTP's
+    # physical tail block before any slot can be reseeded after compaction.
     _v4_decode_state_scatter(self, _state_pool_view_g, _state_block_ids_g, active_bs)
 
     return result
@@ -1442,8 +1437,8 @@ def _patched_v4_forward(self, x, positions):
                     # single block (pos < win): whole block is the window
                     self.swa_kv[_si].copy_(_pool_swa[_cb])
 
-        # Per-step col0 ring gather (only pos<win rows now — see metadata).
         _swa_rows = getattr(attn_md, "_eager_swa_gather_rows", None)
+        # Per-step col0 ring gather (only pos<win rows now — see metadata).
         if _swa_rows is not None:
             _v4_decode_swa_gather(
                 self,

@@ -210,13 +210,20 @@ class _ATOMAttnPyObj:
         if swa_bt is None or swa_bt.numel() < bs:
             raise ValueError("V4 graph replay requires an SWA_KV block table")
 
-        block_ids_np = swa_bt[:bs, 0].detach().cpu().numpy().astype(np.int32)
-        block_ids_np = np.maximum(block_ids_np, 0)
+        swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
         state_slots_np = np.arange(bs, dtype=np.int32)
         batch_ids_np = np.full(max_bs, -1, dtype=np.int32)
         batch_ids_np[:bs] = np.arange(bs, dtype=np.int32)
 
         win = int(bufs["_win"])
+        write_cols = np.minimum(positions_np // win, swa_bt_cpu.shape[1] - 1)
+        write_blocks_np = swa_bt_cpu[np.arange(bs), write_cols].astype(np.int32)
+        if np.any(write_blocks_np < 0):
+            raise ValueError(
+                "V4 graph replay current SWA block is not allocated: "
+                f"positions={positions_np.tolist()} blocks={write_blocks_np.tolist()}"
+            )
+        write_offsets_np = (positions_np % win).astype(np.int32)
         index_topk = int(bufs["_index_topk"])
         n_csa_np = ((positions_np + 1) // DSV4_CSA_RATIO).astype(np.int32)
         n_hca_np = ((positions_np + 1) // DSV4_HCA_RATIO).astype(np.int32)
@@ -241,7 +248,8 @@ class _ATOMAttnPyObj:
             "bs": bs,
             "max_bs": max_bs,
             "positions": positions_np,
-            "block_ids": block_ids_np,
+            "swa_write_blocks": write_blocks_np,
+            "swa_write_offsets": write_offsets_np,
             "state_slots": state_slots_np,
             "batch_ids": batch_ids_np,
             "n_csa": n_csa_np,
@@ -260,8 +268,7 @@ class _ATOMAttnPyObj:
         attn_inputs,
         bufs,
         positions_np,
-        block_ids_np,
-        block_ids_buf,
+        write_blocks_np,
         swa_bt,
         region_to_group,
         bs,
@@ -273,25 +280,53 @@ class _ATOMAttnPyObj:
         compact state; only slots with discontinuous positions are reseeded.
         """
         rt = self._runtime
-        current_bid_tuple = tuple(block_ids_np[:bs].tolist())
+        swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
         previous_positions = bufs.get("_prev_seed_positions")
+        previous_write_blocks = bufs.get("_prev_seed_write_blocks")
         current_positions = positions_np[:bs].tolist()
-        if previous_positions is None:
+        current_write_blocks = write_blocks_np[:bs].tolist()
+        if previous_positions is None or previous_write_blocks is None:
             seed_mask = [True] * bs
         else:
-            seed_mask = [
-                (i >= len(previous_positions)) or (pos != previous_positions[i] + 1)
-                for i, pos in enumerate(current_positions)
-            ]
+            seed_mask = []
+            for i, (position, write_block) in enumerate(
+                zip(current_positions, current_write_blocks, strict=True)
+            ):
+                if (
+                    i >= len(previous_positions)
+                    or i >= len(previous_write_blocks)
+                    or position != previous_positions[i] + 1
+                ):
+                    seed_mask.append(True)
+                    continue
+                same_block = write_block == previous_write_blocks[i]
+                crossed_window = position % win == 0
+                previous_block = (
+                    int(
+                        swa_bt_cpu[
+                            i,
+                            min(
+                                max(position // win - 1, 0),
+                                swa_bt_cpu.shape[1] - 1,
+                            ),
+                        ]
+                    )
+                    if crossed_window
+                    else -1
+                )
+                seed_mask.append(
+                    not (
+                        same_block
+                        or (
+                            crossed_window
+                            and previous_block == previous_write_blocks[i]
+                        )
+                    )
+                )
         bufs["_prev_seed_positions"] = current_positions
+        bufs["_prev_seed_write_blocks"] = current_write_blocks
         if not any(seed_mask):
             return
-
-        bufs["_prev_gather_block_ids"] = current_bid_tuple
-        # Keep the device slice alive at the same point as before; graph forward
-        # consumes the owning fixed buffer through bufs["_block_ids"].
-        _ = block_ids_buf[:bs]
-        swa_bt_cpu = swa_bt[:bs].detach().cpu().numpy().astype(np.int32)
 
         from atom.plugin.rtpllm.utils.v4_kv_cache_bridge import (
             CSA_STATE,
@@ -384,7 +419,77 @@ class _ATOMAttnPyObj:
         except Exception as e:
             raise RuntimeError("V4 SWA/STATE seed failed before graph replay") from e
 
-    def _copy_graph_replay_identity_buffers(self, bufs, replay, device):
+    def _persist_previous_graph_swa_token(self, bufs, replay) -> None:
+        """Persist the previous replay's newly written compact SWA row.
+
+        The compact ring self-maintains across graph replays. RTP still needs
+        the new row in its physical tail block so a later batch compaction can
+        reseed the request in a different compact slot. This runs outside graph
+        capture at the start of the next replay.
+        """
+        previous = bufs.get("_previous_graph_replay")
+        if previous is None:
+            return
+        current_positions = replay["positions"][: replay["bs"]].tolist()
+        current_blocks = replay["swa_write_blocks"][: replay["bs"]].tolist()
+        swa_bt_cpu = (
+            replay["swa_bt"][: replay["bs"]].detach().cpu().numpy().astype(np.int32)
+        )
+        selected_rows = []
+        for previous_row, (previous_position, previous_block) in enumerate(
+            zip(
+                previous["positions"],
+                previous["swa_write_blocks"],
+                strict=True,
+            )
+        ):
+            for current_row, (current_position, current_block) in enumerate(
+                zip(current_positions, current_blocks, strict=True)
+            ):
+                if current_position != previous_position + 1:
+                    continue
+                continues_same_block = current_block == previous_block
+                crossed_window = current_position % int(replay["win"]) == 0
+                previous_col = min(
+                    max(current_position // int(replay["win"]) - 1, 0),
+                    swa_bt_cpu.shape[1] - 1,
+                )
+                continues_across_window = (
+                    crossed_window
+                    and int(swa_bt_cpu[current_row, previous_col]) == previous_block
+                )
+                if continues_same_block or continues_across_window:
+                    selected_rows.append(previous_row)
+                    break
+        if not selected_rows:
+            return
+
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        device = self._runtime._model_device
+        rows = torch.tensor(selected_rows, dtype=torch.int64, device=device)
+        blocks = torch.tensor(
+            [previous["swa_write_blocks"][row] for row in selected_rows],
+            dtype=torch.int64,
+            device=device,
+        )
+        offsets = torch.tensor(
+            [previous["swa_write_offsets"][row] for row in selected_rows],
+            dtype=torch.int64,
+            device=device,
+        )
+        for module in self._runtime.model.modules():
+            if not isinstance(module, DeepseekV4Attention):
+                continue
+            compact_swa = getattr(module, "_compact_swa_kv", None)
+            pool_swa = getattr(module, "_rtp_pool_swa_kv", None)
+            if compact_swa is None or pool_swa is None:
+                continue
+            values = compact_swa[rows, offsets]
+            flat_ids = blocks * int(pool_swa.shape[1]) + offsets
+            pool_swa.view(-1, pool_swa.shape[-1]).index_copy_(0, flat_ids, values)
+
+    def _copy_graph_replay_identity_buffers(self, bufs, replay):
         """Copy position/slot identity before graph replay state seeding."""
         bs = replay["bs"]
         bufs["positions"][:bs].copy_(
@@ -395,17 +500,6 @@ class _ATOMAttnPyObj:
             torch.from_numpy(replay["state_slots"]).to(dtype=torch.int32),
             non_blocking=True,
         )
-        block_ids_buf = bufs.get("_block_ids")
-        if block_ids_buf is None:
-            block_ids_buf = torch.zeros(
-                int(bufs["state_slot"].shape[0]), device=device, dtype=torch.int64
-            )
-            bufs["_block_ids"] = block_ids_buf
-        block_ids_buf[:bs].copy_(
-            torch.from_numpy(replay["block_ids"]).to(dtype=torch.int64),
-            non_blocking=True,
-        )
-        return block_ids_buf
 
     @staticmethod
     def _copy_graph_replay_attention_buffers(bufs, replay) -> None:
@@ -469,15 +563,13 @@ class _ATOMAttnPyObj:
         replay = self._extract_graph_replay_metadata(attn_inputs, bufs)
         if replay is None:
             return
-        block_ids_buf = self._copy_graph_replay_identity_buffers(
-            bufs, replay, self._runtime._model_device
-        )
+        self._persist_previous_graph_swa_token(bufs, replay)
+        self._copy_graph_replay_identity_buffers(bufs, replay)
         self._seed_graph_replay_kv_state(
             attn_inputs,
             bufs,
             replay["positions"],
-            replay["block_ids"],
-            block_ids_buf,
+            replay["swa_write_blocks"],
             replay["swa_bt"],
             replay["region_to_group"],
             replay["bs"],
@@ -487,6 +579,11 @@ class _ATOMAttnPyObj:
         self._update_graph_replay_compress_plans(bufs, replay)
         bufs["_state_slot_mapping_cpu"] = replay["state_slots"].copy()
         bufs["_active_bs"] = replay["bs"]
+        bufs["_previous_graph_replay"] = {
+            "positions": replay["positions"][: replay["bs"]].tolist(),
+            "swa_write_blocks": replay["swa_write_blocks"][: replay["bs"]].tolist(),
+            "swa_write_offsets": replay["swa_write_offsets"][: replay["bs"]].tolist(),
+        }
 
 
 class _ATOMDeepSeekV4Runtime(GptModelBase):
