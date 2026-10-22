@@ -67,6 +67,73 @@ def _qsa_graph_slots_kernel(
 class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
     """Bind the QSA side caches and PLE windows to RTP's request/page IDs."""
 
+    @staticmethod
+    def _prefill_state_checkpoints(
+        attn_inputs: Any, metadata: GDNAttentionMetadata, block_size: int
+    ) -> dict[str, torch.Tensor] | None:
+        """Snapshot every cacheable interior block, not just the prefill tail.
+
+        RTP publishes completed hash blocks even when one prefill continues
+        past them. The GDN/PLE state for each published block must therefore
+        be materialized at that exact token boundary before a prefix hit can
+        safely skip the preceding tokens.
+        """
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+        from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+        if block_size <= 0 or block_size % CHUNK_SIZE:
+            raise ValueError("prefix cache requires a chunk-aligned LINEAR block")
+        kernel_block_size = int(
+            getattr(attn_inputs, "kernel_seq_size_per_block", block_size)
+        )
+        if kernel_block_size != block_size:
+            raise ValueError("prefix cache requires matching LINEAR kernel blocks")
+        lengths = attn_inputs.input_lengths
+        prefixes = attn_inputs.prefix_lengths
+        table = attn_inputs.kv_cache_block_id
+        if (
+            lengths.device.type != "cpu"
+            or prefixes.device.type != "cpu"
+            or table.device.type != "cpu"
+            or table.ndim != 2
+            or table.shape[0] != lengths.numel()
+            or prefixes.numel() != lengths.numel()
+        ):
+            raise ValueError("prefix checkpoints require host LINEAR block metadata")
+        rows, slots, offsets, runtime_slots = [], [], [], []
+        for row, (start, length) in enumerate(zip(prefixes.tolist(), lengths.tolist())):
+            end = start + length
+            first_boundary = ((start // block_size) + 1) * block_size
+            last_slot = int(table[row, (end - 1) // block_size])
+            for position in range(first_boundary, end, block_size):
+                offset = position - start
+                if offset % CHUNK_SIZE:
+                    raise ValueError("prefix checkpoint is not on the GDN chunk grid")
+                slot = int(table[row, (position - 1) // block_size])
+                if slot < 0:
+                    continue  # RTP does not publish an unmaterialized LINEAR block.
+                rows.append(row)
+                slots.append(slot)
+                offsets.append(offset)
+                runtime_slots.append(last_slot)
+        if not rows:
+            return None
+        device = metadata.non_spec_query_start_loc.device
+
+        def gpu(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+            metadata.non_spec_query_start_loc, CHUNK_SIZE
+        )
+        return {
+            "rows": gpu(rows),
+            "slots": gpu(slots),
+            "offs": gpu(offsets),
+            "is_end": gpu([0] * len(rows)),
+            "runtime": gpu(runtime_slots),
+        }
+
     @classmethod
     def _build_gdn_metadata(
         cls,
@@ -440,6 +507,34 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             module._rtp_qsa_cache_signature = signature
 
     @staticmethod
+    def _bind_ple_caches(runtime: Any, model: Any, gdn_layers: dict[int, Any]) -> None:
+        ple_layers = [
+            layer.ple for layer in model.model.layers if layer.ple is not None
+        ]
+        if not ple_layers:
+            return
+        if len(ple_layers) != 1 or not gdn_layers:
+            raise ValueError("PLE requires one layer and a GDN layer cache")
+        ple = ple_layers[0]
+        raw = runtime.kv_cache.get_layer_cache(min(gdn_layers)).kv_cache_base
+        slots = int(raw.shape[0])
+        signature = (raw.data_ptr(), slots, ple.hc_hidden_size, ple.conv_state_len)
+        if getattr(runtime, "_rtp_ple_cache_signature", None) == signature:
+            return
+        runtime._rtp_ple_ngram = torch.full(
+            (slots, ple.ple_embedding.ngram_size - 1),
+            int(model.config.eos_token_id),
+            device=raw.device,
+            dtype=torch.int64,
+        )
+        runtime._rtp_ple_conv = torch.zeros(
+            (slots, ple.hc_hidden_size, ple.conv_state_len),
+            device=raw.device,
+            dtype=model.atom_config.torch_dtype,
+        )
+        runtime._rtp_ple_cache_signature = signature
+
+    @staticmethod
     def _ple_metadata(
         runtime: Any, model: Any, attn_metadata: Any, gdn_layers: dict[int, Any]
     ) -> Qwen4ExpPLEMetadata | None:
@@ -456,25 +551,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             and gdn.spec_state_indices_tensor is None
         ):
             raise ValueError("PLE requires GDN state-slot metadata")
-        ple = ple_layers[0]
-        if not gdn_layers:
-            raise ValueError("PLE requires a GDN layer cache")
-        raw = runtime.kv_cache.get_layer_cache(min(gdn_layers)).kv_cache_base
-        slots = int(raw.shape[0])
-        signature = (raw.data_ptr(), slots, ple.hc_hidden_size, ple.conv_state_len)
-        if getattr(runtime, "_rtp_ple_cache_signature", None) != signature:
-            runtime._rtp_ple_ngram = torch.full(
-                (slots, ple.ple_embedding.ngram_size - 1),
-                int(model.config.eos_token_id),
-                device=raw.device,
-                dtype=torch.int64,
-            )
-            runtime._rtp_ple_conv = torch.zeros(
-                (slots, ple.hc_hidden_size, ple.conv_state_len),
-                device=raw.device,
-                dtype=model.atom_config.torch_dtype,
-            )
-            runtime._rtp_ple_cache_signature = signature
+        RTPQwen4ExpContext._bind_ple_caches(runtime, model, gdn_layers)
         spec_indices = (
             gdn.spec_state_indices_tensor
             if getattr(gdn, "rtp_target_verify_block_map", None) is not None
@@ -539,6 +616,24 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         ):
             forward_context = get_forward_context()
             metadata = forward_context.attn_metadata
+            gdn_metadata = metadata.gdn_metadata
+            if (
+                getattr(
+                    runtime._rtp_model_config,
+                    "atom_qwen4_exp_prefix_cache_enabled",
+                    False,
+                )
+                and gdn_metadata is not None
+                and gdn_metadata.num_prefills
+            ):
+                gdn_metadata.ssm_checkpoints = cls._prefill_state_checkpoints(
+                    inputs.attention_inputs,
+                    gdn_metadata,
+                    int(runtime.kv_cache.get_seq_size_per_block("linear")),
+                )
+                gdn_metadata.ssm_conv_state_len = (
+                    int(model.config.linear_conv_kernel_dim) - 1
+                )
             cls._configure_gdn_backends(
                 metadata.gdn_metadata,
                 resolved_layer_maps[0],
@@ -627,4 +722,14 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             metadata.ple_metadata = cls._ple_metadata(
                 runtime, model, metadata, resolved_layer_maps[0]
             )
+            if metadata.ple_metadata is not None and gdn_metadata is not None:
+                metadata.ple_metadata.rtp_checkpoint_targets = (
+                    gdn_metadata.ssm_checkpoints
+                )
+                if gdn_metadata.ssm_checkpoints is not None:
+                    from atom.plugin.rtpllm.utils.qwen4_exp_prefix_cache import (
+                        write_ple_checkpoints,
+                    )
+
+                    metadata.ple_metadata.checkpoint_writer = write_ple_checkpoints
             yield
